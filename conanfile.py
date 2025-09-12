@@ -219,6 +219,10 @@ class FPTN(ConanFile):
             self.cpp_info.includedirs = ["include"]
             self.cpp_info.libdirs = ["lib"]
 
+            self.cpp_info.set_property("cmake_file_name", "OpenSSL")
+            self.cpp_info.components["ssl"].set_property("cmake_target_name", "OpenSSL::SSL")
+            self.cpp_info.components["crypto"].set_property("cmake_target_name", "OpenSSL::Crypto")
+
             # Add depends
             self.cpp_info.requires = [
                 "argparse::argparse",
@@ -231,6 +235,13 @@ class FPTN(ConanFile):
                 "spdlog::spdlog",
                 "zlib::zlib",
             ]
+
+            self.cpp_info.set_property("cmake_target_name", "OpenSSL::SSL")
+            self.cpp_info.set_property("cmake_target_name", "OpenSSL::Crypto")
+
+            if self.settings.os == "iOS":
+                self.cpp_info.frameworks = ["Security", "CFNetwork", "SystemConfiguration"]
+                self.cpp_info.system_libs = ["resolv"]
 
     def config_options(self):
         if self.settings.os == "Windows":
