@@ -34,6 +34,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 namespace {
 std::atomic<fptn::ClientID> client_id_counter = 0;
+constexpr auto kWebsocketIdleTimeout = std::chrono::seconds(300);
 
 std::vector<std::string> GetServerIpAddresses() {
   static std::mutex ip_mutex;
@@ -71,7 +72,8 @@ Session::Session(std::uint16_t port,
       running_(false),
       init_completed_(false),
       ws_session_was_opened_(false),
-      full_queue_(false) {
+      full_queue_(false),
+      last_close_reason_("session_closed") {
   try {
     client_id_ = ++client_id_counter;  // atomic operation
 
@@ -86,10 +88,9 @@ Session::Session(std::uint16_t port,
         boost::beast::role_type::server));
     ws_.set_option(boost::beast::websocket::stream_base::timeout{
         .handshake_timeout = std::chrono::seconds(60),  // Handshake timeout
-        .idle_timeout = std::chrono::seconds(60),       // Idle timeout
+        .idle_timeout = kWebsocketIdleTimeout,
         .keep_alive_pings = true                        // Enable ping timeout
     });
-    // Set a timeout to force reconnection every 30 seconds
     boost::beast::get_lowest_layer(ws_).expires_after(std::chrono::seconds(30));
     init_completed_ = true;
   } catch (const boost::system::system_error& err) {
@@ -106,6 +107,13 @@ Session::Session(std::uint16_t port,
 
 Session::~Session() { Close(); }
 
+void Session::CloseWithReason(std::string reason) {
+  if (!reason.empty()) {
+    last_close_reason_ = std::move(reason);
+  }
+  Close();
+}
+
 boost::asio::awaitable<void> Session::Run() {
   boost::system::error_code ec;
 
@@ -114,7 +122,7 @@ boost::asio::awaitable<void> Session::Run() {
   if (!init_completed_) {
     SPDLOG_ERROR("Session not initialized. Closing connection (client_id={})",
         client_id_);
-    Close();
+    CloseWithReason("session_not_initialized");
     co_return;
   }
 
@@ -125,7 +133,7 @@ boost::asio::awaitable<void> Session::Run() {
     if (probing_result.should_close) {
       SPDLOG_WARN(
           "Connection rejected during probing (client_id={})", client_id_);
-      Close();  // close connection
+      CloseWithReason("probing_rejected");
       co_return;
     }
     // Run proxy
@@ -135,7 +143,7 @@ boost::asio::awaitable<void> Session::Run() {
           "(client_id={}, SNI={}, port={})",
           client_id_, probing_result.sni, port_);
       co_await HandleProxy(probing_result.sni, port_);
-      Close();  // close connection
+      CloseWithReason("probing_redirect_completed");
       co_return;
     } else {
       SPDLOG_INFO(
@@ -152,7 +160,7 @@ boost::asio::awaitable<void> Session::Run() {
     SPDLOG_DEBUG(
         "Probing check passed — continuing session setup (client_id={})",
         client_id_);
-    Close();
+    CloseWithReason(fmt::format("ssl_handshake_failed:{}", ec.message()));
     co_return;
   }
 
@@ -173,7 +181,7 @@ boost::asio::awaitable<void> Session::Run() {
         },
         boost::asio::detached);
   } else {
-    Close();  // Close connection: probing failed, unexpected or HTTP request
+    CloseWithReason("request_rejected_or_non_websocket");
   }
   co_return;
 }
@@ -438,6 +446,9 @@ boost::asio::awaitable<void> Session::RunReader() {
       // read
       co_await ws_.async_read(buffer, token);
       if (ec) {
+        last_close_reason_ = ec == boost::beast::error::timeout
+            ? "server_idle_timeout"
+            : fmt::format("server_read_error:{}", ec.message());
         break;
       }
       // parse
@@ -456,23 +467,29 @@ boost::asio::awaitable<void> Session::RunReader() {
       }
     }
   } catch (const fptn::protocol::protobuf::ProcessingError& err) {
+    last_close_reason_ = "server_protobuf_processing_error";
     SPDLOG_ERROR(
         "RunReader: failed to process protobuf payload (client_id={}): {}",
         client_id_, err.what());
   } catch (const fptn::protocol::protobuf::MessageError& err) {
+    last_close_reason_ = "server_invalid_protobuf_message";
     SPDLOG_ERROR(
         "RunReader: received invalid protobuf message (client_id={}): {}",
         client_id_, err.what());
   } catch (const fptn::protocol::protobuf::UnsupportedProtocolVersion& err) {
+    last_close_reason_ = "server_unsupported_protocol_version";
     SPDLOG_ERROR("RunReader: unsupported protocol version (client_id={}): {}",
         client_id_, err.what());
   } catch (const boost::system::system_error& err) {
+    last_close_reason_ = fmt::format("server_reader_exception:{}", err.code().message());
     SPDLOG_ERROR("RunReader: Boost system error (client_id={}): {} [code={}]",
         client_id_, err.what(), err.code().value());
   } catch (const std::exception& e) {
+    last_close_reason_ = "server_reader_unexpected_exception";
     SPDLOG_ERROR("RunReader: unexpected exception (client_id={}): {}",
         client_id_, e.what());
   } catch (...) {
+    last_close_reason_ = "server_reader_unknown_error";
     SPDLOG_ERROR("RunReader: unknown fatal error (client_id={})", client_id_);
   }
   Close();
@@ -493,6 +510,9 @@ boost::asio::awaitable<void> Session::RunSender() {
       // read
       auto packet = co_await write_channel_.async_receive(token);
       if (!running_ || !write_channel_.is_open() || ec) {
+        if (ec) {
+          last_close_reason_ = fmt::format("server_send_channel_error:{}", ec.message());
+        }
         break;
       }
       if (packet != nullptr) {
@@ -502,6 +522,7 @@ boost::asio::awaitable<void> Session::RunSender() {
           co_await ws_.async_write(
               boost::asio::buffer(msg.data(), msg.size()), token);
           if (ec) {
+            last_close_reason_ = fmt::format("server_write_error:{}", ec.message());
             SPDLOG_ERROR(
                 "RunSender: failed to send packet (client_id={}): {} [code={}]",
                 client_id_, ec.message(), ec.value());
@@ -512,12 +533,15 @@ boost::asio::awaitable<void> Session::RunSender() {
       }
     }
   } catch (const boost::system::system_error& err) {
+    last_close_reason_ = fmt::format("server_sender_exception:{}", err.code().message());
     SPDLOG_ERROR("RunSender: Boost system error (client_id={}): {} [code={}]",
         client_id_, err.what(), err.code().value());
   } catch (const std::exception& e) {
+    last_close_reason_ = "server_sender_unhandled_exception";
     SPDLOG_ERROR("RunSender: unhandled exception (client_id={}): {}",
         client_id_, e.what());
   } catch (...) {
+    last_close_reason_ = "server_sender_unknown_error";
     SPDLOG_ERROR("RunSender: unknown fatal error (client_id={})", client_id_);
   }
   Close();
@@ -546,6 +570,7 @@ boost::asio::awaitable<bool> Session::ProcessRequest() {
       status = co_await HandleHttp(request);
     }
   } catch (const boost::system::system_error& err) {
+    last_close_reason_ = fmt::format("session_handshake_failed:{}", err.code().message());
     SPDLOG_ERROR("Session::handshake failed (client_id={}): {} [{}]",
         client_id_, err.what(), err.code().message());
   }
@@ -620,8 +645,7 @@ boost::asio::awaitable<bool> Session::HandleHttp(
 boost::asio::awaitable<bool> Session::HandleWebSocket(
     const boost::beast::http::request<boost::beast::http::string_body>&
         request) {
-  // Set a long expiration timeout (7 days) to avoid disconnects
-  boost::beast::get_lowest_layer(ws_).expires_after(std::chrono::hours(24 * 7));
+  boost::beast::get_lowest_layer(ws_).expires_never();
 
   if (request.find("Authorization") != request.end() &&
       request.find("ClientIP") != request.end()) {
@@ -653,11 +677,13 @@ boost::asio::awaitable<bool> Session::HandleWebSocket(
       ws_session_was_opened_ = true;
       co_return status;
     } catch (const std::exception& ex) {
+      last_close_reason_ = "websocket_open_invalid_client_address";
       SPDLOG_ERROR(
           "Session::Open (client_id={}): Exception caught while creating IP "
           "addresses or running callback: {}",
           client_id_, ex.what());
     } catch (...) {
+      last_close_reason_ = "websocket_open_unknown_error";
       SPDLOG_ERROR(
           "Session::Open (client_id={}): Unknown fatal error caught while "
           "creating IP addresses or running callback",
@@ -757,7 +783,7 @@ void Session::Close() {
   // Call close callback
   if (ws_close_callback_ && ws_session_was_opened_) {
     try {
-      ws_close_callback_(client_id_);
+      ws_close_callback_(client_id_, last_close_reason_);
     } catch (const std::exception& e) {
       SPDLOG_ERROR(
           "WebSocket close callback threw exception (client_id={}): {}",

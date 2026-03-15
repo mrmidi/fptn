@@ -68,5 +68,6 @@ using WebSocketNewIPPacketCallback = std::function<void(
   fptn::common::network::IPPacketPtr packet)>;
 
 using WebSocketCloseConnectionCallback = std::function<void(
-  fptn::ClientID client_id)>;
+  fptn::ClientID client_id,
+  const std::string& reason)>;
 }  // namespace fptn::web

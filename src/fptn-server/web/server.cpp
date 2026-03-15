@@ -60,7 +60,7 @@ Server::Server(std::uint16_t port,
       // NOLINTNEXTLINE(modernize-avoid-bind)
       std::bind(&Server::HandleWsNewIPPacket, this, _1),
       // NOLINTNEXTLINE(modernize-avoid-bind)
-      std::bind(&Server::HandleWsCloseConnection, this, _1));
+    std::bind(&Server::HandleWsCloseConnection, this, _1, _2));
   listener_->AddApiHandle(
       // NOLINTNEXTLINE(modernize-avoid-bind)
       kUrlDns_, "GET", std::bind(&Server::HandleApiDns, this, _1, _2));
@@ -301,7 +301,9 @@ void Server::HandleWsNewIPPacket(
   from_client_->Push(std::move(packet));
 }
 
-void Server::HandleWsCloseConnection(fptn::ClientID client_id) noexcept {
+void Server::HandleWsCloseConnection(
+    fptn::ClientID client_id,
+    const std::string& reason) noexcept {
   SessionSPtr session;
   if (running_) {
     const std::unique_lock<std::mutex> lock(mutex_);  // mutex
@@ -314,10 +316,12 @@ void Server::HandleWsCloseConnection(fptn::ClientID client_id) noexcept {
   }
   if (session != nullptr) {
     session->Close();
-    SPDLOG_INFO("Session closed and removed (client_id={})", client_id);
+    SPDLOG_INFO("Session closed and removed (client_id={}) reason={}",
+        client_id, reason);
   } else {
     SPDLOG_WARN(
-        "Attempted to close non-existent session (client_id={})", client_id);
+        "Attempted to close non-existent session (client_id={}) reason={}",
+        client_id, reason);
   }
   nat_table_->DelClientSession(client_id);
 }

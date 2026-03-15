@@ -6,6 +6,8 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 #include "fptn-protocol-lib/websocket/websocket_client.h"
 
+#include <string_view>
+
 #include <memory>
 #include <string>
 #include <utility>
@@ -18,6 +20,41 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 using fptn::protocol::websocket::WebsocketClient;
 
+namespace {
+std::string NormalizeDisconnectReason(
+    boost::beast::error_code ec,
+    std::string_view what,
+    int idle_timeout_seconds,
+    bool was_connected) {
+  if (!ec) {
+    return "connection_closed";
+  }
+
+  if (ec == boost::asio::error::operation_aborted) {
+    return "local_stop";
+  }
+
+  if (ec == boost::beast::error::timeout) {
+    if (was_connected) {
+      return fmt::format(
+          "idle_timeout:{}:{}s", what, idle_timeout_seconds);
+    }
+    return fmt::format("handshake_timeout:{}", what);
+  }
+
+  if (ec == boost::beast::websocket::error::closed) {
+    return "remote_closed";
+  }
+
+  if (ec == boost::asio::error::eof ||
+      ec == boost::asio::ssl::error::stream_truncated) {
+    return fmt::format("remote_eof:{}", what);
+  }
+
+  return fmt::format("transport_error:{}:{}", what, ec.what());
+}
+}  // namespace
+
 WebsocketClient::WebsocketClient(fptn::common::network::IPv4Address server_ip,
     int server_port,
     fptn::common::network::IPv4Address tun_interface_address_ipv4,
@@ -26,7 +63,9 @@ WebsocketClient::WebsocketClient(fptn::common::network::IPv4Address server_ip,
     std::string sni,
     std::string access_token,
     std::string expected_md5_fingerprint,
-    OnConnectedCallback on_connected_callback)
+    int idle_timeout_seconds,
+    OnConnectedCallback on_connected_callback,
+    OnDisconnectedCallback on_disconnected_callback)
     : ctx_(fptn::protocol::tls::CreateNewSslCtx()),
       resolver_(boost::asio::make_strand(ioc_)),
       ws_(boost::asio::make_strand(ioc_), ctx_),
@@ -41,7 +80,9 @@ WebsocketClient::WebsocketClient(fptn::common::network::IPv4Address server_ip,
       sni_(std::move(sni)),
       access_token_(std::move(access_token)),
       expected_md5_fingerprint_(std::move(expected_md5_fingerprint)),
-      on_connected_callback_(std::move(on_connected_callback)) {
+      idle_timeout_seconds_(idle_timeout_seconds),
+      on_connected_callback_(std::move(on_connected_callback)),
+      on_disconnected_callback_(std::move(on_disconnected_callback)) {
   auto* ssl = ws_.next_layer().native_handle();
   fptn::protocol::tls::SetHandshakeSni(ssl, sni_);
   fptn::protocol::tls::SetHandshakeSessionID(ssl);
@@ -73,6 +114,8 @@ WebsocketClient::~WebsocketClient() {
 void WebsocketClient::Run() {
   try {
     running_ = true;
+    disconnect_notified_ = false;
+    last_disconnect_reason_.clear();
     SPDLOG_INFO("Connection: {}:{}", server_ip_.ToString(), server_port_str_);
 
     auto self = shared_from_this();
@@ -101,7 +144,7 @@ void WebsocketClient::Run() {
             } catch (const std::exception& e) {
               SPDLOG_ERROR("Failed to cancel resolver: {}", e.what());
             }
-            self->Stop();
+            self->StopWithReason("DNS resolution timeout", true);
           }
         });
 
@@ -119,7 +162,7 @@ void WebsocketClient::Run() {
 
           if (ec) {
             SPDLOG_ERROR("Resolve error: {}", ec.message());
-            self->Stop();
+            self->Fail(ec, "resolve");
             return;
           }
 
@@ -128,10 +171,10 @@ void WebsocketClient::Run() {
             self->onResolve(ec, std::move(results));
           } catch (const std::exception& e) {
             SPDLOG_ERROR("Exception in onResolve: {}", e.what());
-            self->Stop();
+            self->StopWithReason(std::string("Exception in onResolve: ") + e.what(), true);
           } catch (...) {
             SPDLOG_ERROR("Unknown critical error in onResolve");
-            self->Stop();
+            self->StopWithReason("Unknown critical error in onResolve", true);
           }
         });
     ioc_.run();
@@ -143,7 +186,17 @@ void WebsocketClient::Run() {
 }
 
 bool WebsocketClient::Stop() {
+  const std::string reason = last_disconnect_reason_.empty()
+      ? std::string("local_stop")
+      : last_disconnect_reason_;
+  return StopWithReason(reason, false);
+}
+
+bool WebsocketClient::StopWithReason(std::string reason, bool notify_disconnect) {
   if (!running_) {
+    if (notify_disconnect && !reason.empty()) {
+      NotifyDisconnected(was_connected_, reason);
+    }
     return false;
   }
 
@@ -151,9 +204,18 @@ bool WebsocketClient::Stop() {
 
   // cppcheck-suppress identicalConditionAfterEarlyExit
   if (!running_) {  // Double-check after acquiring lock
+    if (notify_disconnect && !reason.empty()) {
+      NotifyDisconnected(was_connected_, reason);
+    }
     return false;
   }
-  SPDLOG_INFO("Marked client as stopped and disconnected");
+  const bool was_connected = was_connected_;
+  if (!reason.empty()) {
+    last_disconnect_reason_ = reason;
+  }
+  SPDLOG_INFO("Marked client as stopped and disconnected reason={}",
+      last_disconnect_reason_.empty() ? std::string("manual_stop")
+                                      : last_disconnect_reason_);
 
   running_ = false;
   was_connected_ = false;
@@ -223,7 +285,22 @@ bool WebsocketClient::Stop() {
   }
 
   SPDLOG_INFO("WebSocket client stopped successfully");
+  if (notify_disconnect) {
+    NotifyDisconnected(was_connected, last_disconnect_reason_);
+  }
   return true;
+}
+
+void WebsocketClient::NotifyDisconnected(bool was_connected,
+    const std::string& reason) {
+  if (disconnect_notified_.exchange(true)) {
+    return;
+  }
+  last_disconnect_reason_ = reason;
+  if (nullptr != on_disconnected_callback_) {
+    on_disconnected_callback_(was_connected,
+        reason.empty() ? std::string("connection_closed") : reason);
+  }
 }
 
 void WebsocketClient::onResolve(boost::beast::error_code ec,
@@ -265,13 +342,13 @@ void WebsocketClient::onConnect(boost::beast::error_code ec,
             &WebsocketClient::onSslHandshake, shared_from_this()));
   } catch (boost::system::system_error& err) {
     SPDLOG_ERROR("Exception during onConnect: {}", err.what());
-    Stop();
+    StopWithReason(std::string("Exception during onConnect: ") + err.what(), true);
   } catch (const std::exception& e) {
     SPDLOG_ERROR("Unexpected exception during onConnect: {}", e.what());
-    Stop();
+    StopWithReason(std::string("Unexpected exception during onConnect: ") + e.what(), true);
   } catch (...) {
     SPDLOG_ERROR("Unknown exception occurred during onConnect");
-    Stop();
+    StopWithReason("Unknown exception during onConnect", true);
   }
 }
 
@@ -324,13 +401,13 @@ void WebsocketClient::onSslHandshake(boost::beast::error_code ec) {
             &WebsocketClient::onHandshake, shared_from_this()));
   } catch (const boost::system::system_error& err) {
     SPDLOG_ERROR("Exception during onSslHandshake: {}", err.what());
-    Stop();
+    StopWithReason(std::string("Exception during onSslHandshake: ") + err.what(), true);
   } catch (const std::exception& e) {
     SPDLOG_ERROR("Unexpected exception during onSslHandshake: {}", e.what());
-    Stop();
+    StopWithReason(std::string("Unexpected exception during onSslHandshake: ") + e.what(), true);
   } catch (...) {
     SPDLOG_ERROR("Unknown exception occurred during onSslHandshake");
-    Stop();
+    StopWithReason("Unknown exception during onSslHandshake", true);
   }
 }
 
@@ -346,9 +423,11 @@ void WebsocketClient::onHandshake(boost::beast::error_code ec) {
     // NOLINTNEXTLINE(modernize-use-designated-initializers)
     ws_.set_option(boost::beast::websocket::stream_base::timeout{
         std::chrono::seconds(10),  // handshake_timeout
-        std::chrono::seconds(5),   // idle_timeout
+      std::chrono::seconds(idle_timeout_seconds_),
         true                       // keep_alive_pings
     });
+    SPDLOG_INFO("WebSocket timeout config handshake=10s idle={}s keep_alive_pings=true",
+        idle_timeout_seconds_);
 
     if (nullptr != on_connected_callback_) {
       on_connected_callback_();
@@ -356,13 +435,13 @@ void WebsocketClient::onHandshake(boost::beast::error_code ec) {
     DoRead();
   } catch (const boost::system::system_error& err) {
     SPDLOG_ERROR("Exception during onHandshake: {}", err.what());
-    Stop();
+    StopWithReason(std::string("Exception during onHandshake: ") + err.what(), true);
   } catch (const std::exception& e) {
     SPDLOG_ERROR("Unexpected exception during onHandshake: {}", e.what());
-    Stop();
+    StopWithReason(std::string("Unexpected exception during onHandshake: ") + e.what(), true);
   } catch (...) {
     SPDLOG_ERROR("Unknown exception occurred during onHandshake");
-    Stop();
+    StopWithReason("Unknown exception during onHandshake", true);
   }
 }
 
@@ -385,22 +464,35 @@ void WebsocketClient::onRead(
       DoRead();
     } catch (const boost::system::system_error& err) {
       SPDLOG_ERROR("Exception during onRead: {}", err.what());
-      Stop();
+      StopWithReason(std::string("Exception during onRead: ") + err.what(), true);
     } catch (const std::exception& e) {
       SPDLOG_ERROR("Unexpected exception during onRead: {}", e.what());
-      Stop();
+      StopWithReason(std::string("Unexpected exception during onRead: ") + e.what(), true);
     } catch (...) {
       SPDLOG_ERROR("Unknown exception occurred during onRead");
-      Stop();
+      StopWithReason("Unknown exception during onRead", true);
     }
   }
 }
 
 void WebsocketClient::Fail(boost::beast::error_code ec, char const* what) {
+  std::string reason = NormalizeDisconnectReason(
+      ec, what, idle_timeout_seconds_, was_connected_);
+
   if (running_) {
-    SPDLOG_ERROR("Fail {}: {}", what, ec.what());
+    if (reason.rfind("idle_timeout:", 0) == 0) {
+      SPDLOG_WARN("WebSocket disconnected due to {}", reason);
+    } else if (reason == "local_stop") {
+      SPDLOG_INFO("WebSocket stopped locally during {}", what);
+    } else if (reason == "remote_closed" || reason.rfind("remote_eof:", 0) == 0) {
+      SPDLOG_WARN("WebSocket remote closure during {} reason={}", what, reason);
+    } else {
+      SPDLOG_ERROR("WebSocket failure during {} reason={}", what, reason);
+    }
   }
-  Stop();
+
+  StopWithReason(reason.empty() ? std::string("transport_failure") : reason,
+      true);
 }
 
 void WebsocketClient::DoRead() {
@@ -411,13 +503,13 @@ void WebsocketClient::DoRead() {
                        &WebsocketClient::onRead, shared_from_this()));
     } catch (const boost::system::system_error& err) {
       SPDLOG_ERROR("Exception during DoRead: {}", err.what());
-      Stop();
+      StopWithReason(std::string("Exception during DoRead: ") + err.what(), true);
     } catch (const std::exception& e) {
       SPDLOG_ERROR("Unexpected exception during DoRead: {}", e.what());
-      Stop();
+      StopWithReason(std::string("Unexpected exception during DoRead: ") + e.what(), true);
     } catch (...) {
       SPDLOG_ERROR("Unknown exception occurred during DoRead");
-      Stop();
+      StopWithReason("Unknown exception during DoRead", true);
     }
   }
 }
@@ -465,13 +557,13 @@ void WebsocketClient::DoWrite() {
     }
   } catch (boost::system::system_error& err) {
     SPDLOG_ERROR("doWrite system_error: {}", err.what());
-    Stop();
+    StopWithReason(std::string("doWrite system_error: ") + err.what(), true);
   } catch (const std::exception& e) {
     SPDLOG_ERROR("doWrite error: {}", e.what());
-    Stop();
+    StopWithReason(std::string("doWrite error: ") + e.what(), true);
   } catch (...) {
     SPDLOG_ERROR("Unknown exception occurred during doWrite");
-    Stop();
+    StopWithReason("Unknown exception during doWrite", true);
   }
 }
 
@@ -494,3 +586,10 @@ void WebsocketClient::onWrite(boost::beast::error_code ec, std::size_t) {
 }
 
 bool WebsocketClient::IsStarted() { return running_ && was_connected_; }
+
+bool WebsocketClient::WasConnected() const { return was_connected_; }
+
+std::string WebsocketClient::LastDisconnectReason() const {
+  const std::unique_lock<std::mutex> lock(mutex_);
+  return last_disconnect_reason_;
+}

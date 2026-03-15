@@ -49,6 +49,7 @@ class Session : public std::enable_shared_from_this<Session> {
   boost::asio::awaitable<bool> Send(fptn::common::network::IPPacketPtr packet);
 
  protected:
+  void CloseWithReason(std::string reason);
   boost::asio::awaitable<void> RunReader();
   boost::asio::awaitable<void> RunSender();
 
@@ -98,6 +99,7 @@ class Session : public std::enable_shared_from_this<Session> {
   bool init_completed_;
   bool ws_session_was_opened_;
   std::atomic<bool> full_queue_;
+  std::string last_close_reason_;
 
   boost::asio::cancellation_signal cancel_signal_;
 };

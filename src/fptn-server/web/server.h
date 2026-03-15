@@ -68,7 +68,9 @@ class Server final {
       const std::string& url,
       const std::string& access_token);
   void HandleWsNewIPPacket(fptn::common::network::IPPacketPtr packet) noexcept;
-  void HandleWsCloseConnection(fptn::ClientID client_id) noexcept;
+  void HandleWsCloseConnection(
+      fptn::ClientID client_id,
+      const std::string& reason) noexcept;
 
  private:
   const std::string kUrlDns_ = "/api/v1/dns";
