@@ -7,6 +7,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 #include "fptn-protocol-lib/https/https_client.h"
 
 #include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -46,6 +47,36 @@ using fptn::protocol::https::HttpsClient;
 using fptn::protocol::https::Response;
 
 namespace {
+
+std::string BuildRequestContext(const char* method,
+    const std::string& host,
+    int port,
+    const std::string& sni,
+    const std::string& handle,
+    int timeout,
+    const char* stage) {
+  std::ostringstream stream;
+  stream << "method=" << method << " host=" << host << " port=" << port
+         << " sni=" << sni << " path=" << handle << " timeout=" << timeout
+         << "s stage=" << stage;
+  return stream.str();
+}
+
+std::string BuildBoostErrorMessage(const char* method,
+    const std::string& host,
+    int port,
+    const std::string& sni,
+    const std::string& handle,
+    int timeout,
+    const char* stage,
+    const boost::system::system_error& error) {
+  std::ostringstream stream;
+  stream << BuildRequestContext(method, host, port, sni, handle, timeout, stage)
+         << " boost_code=" << error.code().value()
+         << " category=" << error.code().category().name()
+         << " message=" << error.what();
+  return stream.str();
+}
 
 std::string DecompressGzip(const std::string& compressed) {
   constexpr std::size_t kChunkSize = 4096;
@@ -171,9 +202,12 @@ Response HttpsClient::Get(const std::string& handle, int timeout) {
   std::string body;
   std::string error;
   int respcode = 400;
+  const char* stage = "init";
 
   SSL* ssl = nullptr;
   try {
+    SPDLOG_INFO("HTTPS GET start: {}",
+        BuildRequestContext("GET", host_, port_, sni_, handle, timeout, "init"));
     boost::asio::io_context ioc;
 
     SSL_CTX* ssl_ctx = fptn::protocol::tls::CreateNewSslCtx();
@@ -183,7 +217,9 @@ Response HttpsClient::Get(const std::string& handle, int timeout) {
     boost::beast::ssl_stream<boost::beast::tcp_stream> stream(ioc, ctx);
 
     const std::string port = std::to_string(port_);
+    stage = "resolve";
     auto const results = resolver.resolve(host_, port);
+    stage = "connect";
     boost::beast::get_lowest_layer(stream).expires_after(
         std::chrono::seconds(timeout));
     boost::beast::get_lowest_layer(stream).connect(results);
@@ -201,6 +237,7 @@ Response HttpsClient::Get(const std::string& handle, int timeout) {
       ctx.set_verify_mode(boost::asio::ssl::verify_none);
     }
 
+    stage = "tls_handshake";
     stream.handshake(boost::asio::ssl::stream_base::client);
 
     boost::beast::http::request<boost::beast::http::string_body> req{
@@ -210,19 +247,26 @@ Response HttpsClient::Get(const std::string& handle, int timeout) {
       req.set(key, value);
     }
 
+    stage = "write_request";
     boost::beast::get_lowest_layer(stream).expires_after(
         std::chrono::seconds(timeout));
     boost::beast::http::write(stream, req);
 
     boost::beast::flat_buffer buffer;
     boost::beast::http::response<boost::beast::http::dynamic_body> res;
+    stage = "read_response";
     boost::beast::get_lowest_layer(stream).expires_after(
         std::chrono::seconds(timeout));
     boost::beast::http::read(stream, buffer, res);
 
     respcode = static_cast<int>(res.result_int());
     body = GetHttpBody(res);
+    SPDLOG_INFO("HTTPS GET completed: {} status={} body_bytes={}",
+      BuildRequestContext("GET", host_, port_, sni_, handle, timeout,
+        "completed"),
+      respcode, body.size());
 
+    stage = "shutdown";
     boost::beast::get_lowest_layer(stream).expires_after(
         std::chrono::seconds(timeout));
 
@@ -231,16 +275,19 @@ Response HttpsClient::Get(const std::string& handle, int timeout) {
     try {
       boost::beast::get_lowest_layer(stream).close();
     } catch (boost::system::system_error const& e) {
-      SPDLOG_ERROR("Exception during HttpsClient::Get: {}", e.what());
+      SPDLOG_ERROR("Exception during HttpsClient::Post: {}", e.what());
     }
   } catch (const boost::system::system_error& err) {
 #ifdef _WIN32
-    error = boost::nowide::narrow(boost::nowide::widen(err.what()));
+    error = boost::nowide::narrow(boost::nowide::widen(
+        BuildBoostErrorMessage(
+            "GET", host_, port_, sni_, handle, timeout, stage, err)));
 #else
-    error = err.what();
+    error = BuildBoostErrorMessage(
+        "GET", host_, port_, sni_, handle, timeout, stage, err);
 #endif
     respcode = 600;
-    SPDLOG_ERROR("Exception during HttpsClient::Get: {}", error);
+    SPDLOG_ERROR("HTTPS GET failed: {}", error);
   } catch (const std::exception& e) {
 #ifdef _WIN32
     error = boost::nowide::narrow(boost::nowide::widen(e.what()));
@@ -248,11 +295,13 @@ Response HttpsClient::Get(const std::string& handle, int timeout) {
     error = e.what();
 #endif
     respcode = 601;
-    SPDLOG_ERROR("Exception during HttpsClient::Get: {}", error);
+    SPDLOG_ERROR("HTTPS GET failed: {} context={}", error,
+        BuildRequestContext("GET", host_, port_, sni_, handle, timeout, stage));
   } catch (...) {
     error = "Unknown exception";
     respcode = 602;
-    SPDLOG_ERROR("Unknown exception occurred during HttpsClient::Get");
+    SPDLOG_ERROR("HTTPS GET failed: {}",
+        BuildRequestContext("GET", host_, port_, sni_, handle, timeout, stage));
   }
   if (ssl) {
     fptn::protocol::tls::AttachCertificateVerificationCallbackDelete(ssl);
@@ -267,9 +316,13 @@ Response HttpsClient::Post(const std::string& handle,
   std::string body;
   std::string error;
   int respcode = 400;
+  const char* stage = "init";
 
   SSL* ssl = nullptr;
   try {
+    SPDLOG_INFO("HTTPS POST start: {} body_bytes={}",
+        BuildRequestContext("POST", host_, port_, sni_, handle, timeout, "init"),
+        request.size());
     boost::asio::io_context ioc;
     SSL_CTX* ssl_ctx = fptn::protocol::tls::CreateNewSslCtx();
     boost::asio::ssl::context ctx(ssl_ctx);
@@ -278,8 +331,10 @@ Response HttpsClient::Post(const std::string& handle,
     boost::beast::ssl_stream<boost::beast::tcp_stream> stream(ioc, ctx);
 
     const std::string port = std::to_string(port_);
+    stage = "resolve";
     auto const results = resolver.resolve(host_, port);
 
+    stage = "connect";
     boost::beast::get_lowest_layer(stream).expires_after(
         std::chrono::seconds(timeout));
     boost::beast::get_lowest_layer(stream).connect(results);
@@ -297,6 +352,7 @@ Response HttpsClient::Post(const std::string& handle,
       ctx.set_verify_mode(boost::asio::ssl::verify_none);
     }
 
+    stage = "tls_handshake";
     stream.handshake(boost::asio::ssl::stream_base::client);
 
     boost::beast::http::request<boost::beast::http::string_body> req{
@@ -312,19 +368,26 @@ Response HttpsClient::Post(const std::string& handle,
     req.body() = request;
     req.prepare_payload();
 
+    stage = "write_request";
     boost::beast::get_lowest_layer(stream).expires_after(
         std::chrono::seconds(timeout));
     boost::beast::http::write(stream, req);
 
     boost::beast::flat_buffer buffer;
     boost::beast::http::response<boost::beast::http::dynamic_body> res;
+    stage = "read_response";
     boost::beast::get_lowest_layer(stream).expires_after(
         std::chrono::seconds(timeout));
     boost::beast::http::read(stream, buffer, res);
 
     respcode = static_cast<int>(res.result_int());
     body = GetHttpBody(res);
+    SPDLOG_INFO("HTTPS POST completed: {} status={} body_bytes={}",
+      BuildRequestContext("POST", host_, port_, sni_, handle, timeout,
+        "completed"),
+      respcode, body.size());
 
+    stage = "shutdown";
     boost::beast::get_lowest_layer(stream).expires_after(
         std::chrono::seconds(timeout));
     boost::system::error_code ec;
@@ -336,12 +399,15 @@ Response HttpsClient::Post(const std::string& handle,
     }
   } catch (const boost::system::system_error& err) {
 #ifdef _WIN32
-    error = boost::nowide::narrow(boost::nowide::widen(err.what()));
+    error = boost::nowide::narrow(boost::nowide::widen(
+        BuildBoostErrorMessage(
+            "POST", host_, port_, sni_, handle, timeout, stage, err)));
 #else
-    error = err.what();
+    error = BuildBoostErrorMessage(
+        "POST", host_, port_, sni_, handle, timeout, stage, err);
 #endif
     respcode = 600;
-    SPDLOG_ERROR("Exception during HttpsClient::Post: {}", error);
+    SPDLOG_ERROR("HTTPS POST failed: {}", error);
   } catch (const std::exception& e) {
 #ifdef _WIN32
     error = boost::nowide::narrow(boost::nowide::widen(e.what()));
@@ -349,11 +415,13 @@ Response HttpsClient::Post(const std::string& handle,
     error = e.what();
 #endif
     respcode = 601;
-    SPDLOG_ERROR("Exception during HttpsClient::Post: {}", error);
+    SPDLOG_ERROR("HTTPS POST failed: {} context={}", error,
+        BuildRequestContext("POST", host_, port_, sni_, handle, timeout, stage));
   } catch (...) {
     error = "Unknown exception";
     respcode = 602;
-    SPDLOG_ERROR("Unknown exception occurred during HttpsClient::Post");
+    SPDLOG_ERROR("HTTPS POST failed: {}",
+        BuildRequestContext("POST", host_, port_, sni_, handle, timeout, stage));
   }
   if (ssl) {
     fptn::protocol::tls::AttachCertificateVerificationCallbackDelete(ssl);
