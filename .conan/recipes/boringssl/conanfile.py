@@ -27,16 +27,26 @@ class BoringSSLConan(ConanFile):
         tc.variables["BUILD_TESTING"] = False
         tc.variables["ENABLE_EXPRESSION_TESTS"] = False
         
-        # Правильная настройка для iOS
-        if self.settings.os == "iOS":
-            tc.variables["CMAKE_SYSTEM_NAME"] = "iOS"
+        # Apple mobile platforms: iOS + tvOS
+        if str(self.settings.os) in {"iOS", "tvOS"}:
+            if str(self.settings.os) == "tvOS":
+                tc.variables["CMAKE_SYSTEM_NAME"] = "tvOS"
+            else:
+                tc.variables["CMAKE_SYSTEM_NAME"] = "iOS"
             tc.variables["CMAKE_OSX_DEPLOYMENT_TARGET"] = str(self.settings.os.version)
             tc.variables["CMAKE_OSX_ARCHITECTURES"] = self.settings.arch
             tc.variables["CMAKE_MACOSX_BUNDLE"] = False
-            if "simulator" in str(self.settings.os.sdk).lower():
-                tc.variables["CMAKE_OSX_SYSROOT"] = "iphonesimulator"
+            sdk = str(self.settings.os.sdk).lower()
+            if str(self.settings.os) == "tvOS":
+                if "simulator" in sdk:
+                    tc.variables["CMAKE_OSX_SYSROOT"] = "appletvsimulator"
+                else:
+                    tc.variables["CMAKE_OSX_SYSROOT"] = "appletvos"
             else:
-                tc.variables["CMAKE_OSX_SYSROOT"] = "iphoneos"
+                if "simulator" in sdk:
+                    tc.variables["CMAKE_OSX_SYSROOT"] = "iphonesimulator"
+                else:
+                    tc.variables["CMAKE_OSX_SYSROOT"] = "iphoneos"
             tc.variables["CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED"] = "NO"
             tc.variables["CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED"] = "NO"
             tc.variables["CMAKE_XCODE_ATTRIBUTE_ENABLE_BITCODE"] = "YES"
@@ -67,6 +77,6 @@ class BoringSSLConan(ConanFile):
         self.cpp_info.components["ssl"].set_property("cmake_target_name", "OpenSSL::SSL")
         self.cpp_info.components["crypto"].set_property("cmake_target_name", "OpenSSL::Crypto")
 
-        if self.settings.os == "iOS":
+        if str(self.settings.os) in {"iOS", "tvOS"}:
             self.cpp_info.frameworks = ["Security", "Foundation", "CoreFoundation"]
             self.cpp_info.system_libs = ["c++"]

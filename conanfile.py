@@ -235,14 +235,14 @@ class FPTN(ConanFile):
                 "zlib::zlib",
             ]
 
-            if self.settings.os == "iOS":
+            if self.settings.os in ["iOS", "tvOS"]:
                 self.cpp_info.frameworks = ["Security", "CFNetwork", "SystemConfiguration"]
                 self.cpp_info.system_libs = ["resolv"]
 
     def config_options(self):
         if self.settings.os == "Windows":
             self.options.rm_safe("fPIC")
-        if self.settings.os in ["iOS", "Android"]:
+        if self.settings.os in ["iOS", "Android", "tvOS"]:
             self.options["boost"].without_process = True
 
     def export(self):
