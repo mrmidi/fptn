@@ -6,6 +6,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 #include "fptn-protocol-lib/https/websocket_client/websocket_client.h"
 
+#include <algorithm>
 #include <https/utils/change_cipher_spec.h>
 #include <memory>
 #include <string>
@@ -20,6 +21,10 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 #include "fptn-protocol-lib/https/api_client/api_client.h"
 #include "fptn-protocol-lib/https/obfuscator/methods/tls2/tls_obfuscator2.h"
 
+#ifdef __APPLE__
+#include <netinet/tcp.h>
+#endif
+
 namespace fptn::protocol::https {
 
 WebsocketClient::WebsocketClient(fptn::common::network::IPv4Address server_ip,
@@ -32,11 +37,13 @@ WebsocketClient::WebsocketClient(fptn::common::network::IPv4Address server_ip,
     std::string expected_md5_fingerprint,
     CensorshipStrategy censorship_strategy,
     OnConnectedCallback on_connected_callback,
-    int thread_number)
+    int thread_number,
+    int idle_timeout_seconds)
     : ioc_(thread_number),
       ctx_(https::utils::CreateNewSslCtx()),
       resolver_(boost::asio::make_strand(ioc_)),
       censorship_strategy_(censorship_strategy),
+      idle_timeout_seconds_(std::max(1, idle_timeout_seconds)),
       ws_(ssl_stream_type(
           obfuscator_socket_type(boost::asio::make_strand(ioc_), nullptr),
           ctx_)),
@@ -362,6 +369,21 @@ boost::asio::awaitable<bool> WebsocketClient::Connect() {
     // TCP options
     socket.set_option(boost::asio::ip::tcp::no_delay(true));
     socket.set_option(boost::asio::socket_base::reuse_address(true));
+    socket.set_option(boost::asio::socket_base::keep_alive(true));
+
+#ifdef __APPLE__
+    // Darwin-specific TCP keepalive fine-tuning.
+    // Kernel probes run during device sleep — no app CPU needed.
+    {
+        int fd = socket.native_handle();
+        int keepidle = 15;   // idle seconds before first probe
+        int keepintvl = 5;   // seconds between probes
+        int keepcnt  = 3;    // probe count before declaring dead
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &keepidle, sizeof(keepidle));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,  &keepcnt,  sizeof(keepcnt));
+    }
+#endif
 
     // Optimize socket buffers
     try {
@@ -463,7 +485,7 @@ boost::asio::awaitable<bool> WebsocketClient::Connect() {
     try {
       boost::beast::websocket::stream_base::timeout timeout_option;
       timeout_option.handshake_timeout = std::chrono::seconds(10);
-      timeout_option.idle_timeout = std::chrono::seconds(4);
+      timeout_option.idle_timeout = std::chrono::seconds(idle_timeout_seconds_);
       timeout_option.keep_alive_pings = true;
       ws_.set_option(timeout_option);
     } catch (const std::exception& e) {

@@ -47,7 +47,8 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
       std::string expected_md5_fingerprint,
       CensorshipStrategy censorship_strategy,
       OnConnectedCallback on_connected_callback = nullptr,
-      int thread_number = 4);
+      int thread_number = 4,
+      int idle_timeout_seconds = 4);
 
   virtual ~WebsocketClient();
 
@@ -88,6 +89,7 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
   boost::asio::ip::tcp::resolver resolver_;
 
   const CensorshipStrategy censorship_strategy_;
+  const int idle_timeout_seconds_;
 
   // TCP -> obfuscator -> SSL -> WebSocket
   using tcp_stream_type = boost::beast::tcp_stream;
