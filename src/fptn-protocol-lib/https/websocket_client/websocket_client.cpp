@@ -362,7 +362,6 @@ boost::asio::awaitable<bool> WebsocketClient::Connect() {
     socket.set_option(boost::asio::ip::tcp::no_delay(true));
     socket.set_option(boost::asio::socket_base::reuse_address(true));
 
-    /*
     socket.set_option(boost::asio::socket_base::keep_alive(true));
 
 #ifdef __APPLE__
@@ -378,7 +377,6 @@ boost::asio::awaitable<bool> WebsocketClient::Connect() {
         setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,  &keepcnt,  sizeof(keepcnt));
     }
 #endif
-    */
 
     // Optimize socket buffers
     try {
