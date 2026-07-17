@@ -54,6 +54,7 @@ class YaffConan(ConanFile):
         tc.variables["YAFF_BUILD_TESTS"] = False
         tc.variables["YAFF_BUILD_BENCHMARKS"] = False
         tc.variables["YAFF_BUILD_EXAMPLES"] = False
+        tc.variables["CMAKE_MACOSX_BUNDLE"] = False
         tc.generate()
 
     def build(self):
