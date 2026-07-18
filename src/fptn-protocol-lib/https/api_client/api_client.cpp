@@ -62,6 +62,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 namespace {
 
+/*
 bool IsPortOpen(const std::string& host, const int port) {
   try {
     boost::asio::io_context ioc;
@@ -103,6 +104,7 @@ bool IsPortOpen(const std::string& host, const int port) {
     return false;
   }
 }
+*/
 
 std::string DecompressGzip(const std::string& compressed) {
   constexpr std::size_t kChunkSize = 4096;
@@ -326,11 +328,6 @@ Response ApiClient::Get(const std::string& handle, int timeout) const {
   return ExecuteWithTimeout<Response>(
       // NOLINTNEXTLINE(bugprone-exception-escape)
       [self = *this, handle, timeout]() {
-        if (!IsPortOpen(self.host_, self.port_)) {
-          SPDLOG_ERROR("GET [{}] - port {}:{} is not reachable", handle,
-              self.host_, self.port_);
-          return Response{"", 609, "Port not reachable"};
-        }
         return self.GetImpl(handle, timeout);
       },
       timeout, "GET", handle, host_, Response{"", 608, "Operation timeout"});
@@ -344,11 +341,6 @@ Response ApiClient::Post(const std::string& handle,
   return ExecuteWithTimeout<Response>(
       // NOLINTNEXTLINE(bugprone-exception-escape)
       [self = *this, handle, request, content_type, timeout]() {
-        if (!IsPortOpen(self.host_, self.port_)) {
-          SPDLOG_ERROR("POST [{}] - port {}:{} is not reachable", handle,
-              self.host_, self.port_);
-          return Response{"", 609, "Port not reachable"};
-        }
         return self.PostImpl(handle, request, content_type, timeout);
       },
       timeout, "POST", handle, host_, Response{"", 608, "Operation timeout"});
@@ -478,11 +470,6 @@ bool ApiClient::TestHandshake(int timeout) const {
   return ExecuteWithTimeout<bool>(
       // NOLINTNEXTLINE(bugprone-exception-escape)
       [self = *this, timeout]() {
-        if (!IsPortOpen(self.host_, self.port_)) {
-          SPDLOG_ERROR("TestHandshake - port {}:{} is not reachable",
-              self.host_, self.port_);
-          return false;
-        }
         return self.TestHandshakeImpl(timeout);
       },
       timeout, "TestHandshake", "", host_, false);
@@ -950,10 +937,12 @@ bool ApiClient::TestHandshakeImpl(int timeout) const {
     if (IsRealityModeWithFakeHandshake(censorship_strategy_)) {
       SPDLOG_INFO("TestHandshake - Performing fake handshake");
       if (!PerformFakeHandshake2(socket)) {
-        SPDLOG_WARN(
-            "TestHandshake - Fake handshake failed, continuing with real "
-            "handshake");
+        SPDLOG_WARN("TestHandshake - Fake handshake failed");
+        return false;
       }
+      // For Reality Mode we use TLS obfuscator after fake handshake
+      stream.next_layer().set_obfuscator(
+          std::make_shared<protocol::https::obfuscator::TlsObfuscator2>());
     }
     utils::SetHandshakeSessionID(stream.native_handle());
     utils::SetHandshakeSni(stream.native_handle(), sni_);
@@ -971,6 +960,11 @@ bool ApiClient::TestHandshakeImpl(int timeout) const {
 
     // Perform TLS handshake
     stream.handshake(boost::asio::ssl::stream_base::client);
+
+    // Reset obfuscator after TLS-handshake
+    if (IsRealityModeWithFakeHandshake(censorship_strategy_)) {
+      stream.next_layer().set_obfuscator(nullptr);
+    }
 
     // Clean shutdown
     boost::system::error_code ec;
