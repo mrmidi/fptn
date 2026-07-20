@@ -7,7 +7,9 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 #pragma once
 
 #include <atomic>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -30,7 +32,31 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 #include "fptn-protocol-lib/https/utils/tls/tls.h"
 #include "fptn-protocol-lib/protocol/protobuf/protobuf_serializer.h"
 
+// PR1B: iOS-specific queue and batch caps. Other platforms keep the
+// existing 256-packet channel bound with no byte limit.
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 namespace fptn::protocol::https {
+
+// PR1B: typed send result for the outbound queue.
+enum class SendResult : std::uint8_t {
+  accepted = 0,
+  queue_full = 1,
+  transport_stopped = 2,
+  invalid_packet = 3,
+};
+
+#if defined(__APPLE__) && TARGET_OS_IOS
+inline constexpr std::uint64_t kMaxQueuedBytes = 256 * 1024;
+inline constexpr std::size_t kMaxBatchRawBytes = 64 * 1024;
+#else
+inline constexpr std::uint64_t kMaxQueuedBytes =
+    std::numeric_limits<std::uint64_t>::max();
+inline constexpr std::size_t kMaxBatchRawBytes =
+    std::numeric_limits<std::size_t>::max();
+#endif
 
 using fptn::common::network::IPPacketPtr;
 using fptn::common::network::IPv4Address;
@@ -74,7 +100,8 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
 
   void Run();
   bool Stop();
-  bool Send(fptn::common::network::IPPacketPtr packet);
+  // PR1B: typed send result replaces the previous bool return.
+  SendResult Send(fptn::common::network::IPPacketPtr packet);
   bool IsStarted() const;
 
   // PR1A: read-only numeric diagnostics for the wrapper layer.
@@ -86,6 +113,11 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
   static int GetLiveClients() { return live_clients_.load(std::memory_order_relaxed); }
   static int GetActiveReaderCoroutines() { return active_reader_coroutines_.load(std::memory_order_relaxed); }
   static int GetActiveSenderCoroutines() { return active_sender_coroutines_.load(std::memory_order_relaxed); }
+  // PR1B: outbound queue diagnostics.
+  std::uint64_t GetQueuedPackets() const noexcept { return queued_packets_.load(std::memory_order_relaxed); }
+  std::uint64_t GetQueuedBytes() const noexcept { return queued_bytes_.load(std::memory_order_relaxed); }
+  std::uint64_t GetQueuedBytesPeak() const noexcept { return queued_bytes_peak_.load(std::memory_order_relaxed); }
+  std::uint64_t GetQueueFullCount() const noexcept { return queue_full_count_.load(std::memory_order_relaxed); }
 
  protected:
   boost::asio::awaitable<bool> RunInternal();
@@ -144,6 +176,23 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
   std::atomic<int> effective_rcvbuf_bytes_{0};
   std::atomic<int> effective_sndbuf_bytes_{0};
   std::atomic<int> socket_buffer_set_error_count_{0};
+
+  // PR1B: outbound queue byte accounting. Unsigned lifetime/gauge
+  // counters — never reset in Stop(). A new client starts at zero.
+  // PR1C will verify gauges reach zero after all coroutines complete.
+  std::atomic<std::uint64_t> queued_packets_{0};
+  std::atomic<std::uint64_t> queued_bytes_{0};
+  std::atomic<std::uint64_t> queued_bytes_peak_{0};
+  std::atomic<std::uint64_t> queue_full_count_{0};
+
+  // PR1B: overflow-safe CAS reservation. Returns the new total on
+  // success, nullopt if the byte cap would be exceeded.
+  std::optional<std::uint64_t> tryReserveQueuedBytes(
+      std::uint64_t packet_size) noexcept;
+  void updateQueuedBytesPeak(std::uint64_t new_total) noexcept;
+  // Release accounting for a dequeued packet. Must be called before
+  // IP-version validation so discarded packets still release bytes.
+  void releaseDequeuedPacketAccounting(const IPPacketPtr& packet) noexcept;
 
   boost::asio::io_context ioc_;
   boost::asio::ssl::context ctx_;

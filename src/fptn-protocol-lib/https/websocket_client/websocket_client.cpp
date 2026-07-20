@@ -286,16 +286,88 @@ bool WebsocketClient::Stop() {
   return true;
 }
 
-bool WebsocketClient::Send(fptn::common::network::IPPacketPtr packet) {
-  if (!running_ || !was_connected_) {
-    return false;
+// PR1B: overflow-safe byte reservation via CAS loop.
+std::optional<std::uint64_t> WebsocketClient::tryReserveQueuedBytes(
+    std::uint64_t packet_size) noexcept {
+  auto current = queued_bytes_.load(std::memory_order_relaxed);
+  for (;;) {
+    if (packet_size > kMaxQueuedBytes ||
+        current > kMaxQueuedBytes - packet_size) {
+      return std::nullopt;
+    }
+    const auto desired = current + packet_size;
+    if (queued_bytes_.compare_exchange_weak(
+            current, desired,
+            std::memory_order_relaxed, std::memory_order_relaxed)) {
+      return desired;
+    }
   }
+}
+
+void WebsocketClient::updateQueuedBytesPeak(std::uint64_t new_total) noexcept {
+  auto peak = queued_bytes_peak_.load(std::memory_order_relaxed);
+  while (new_total > peak) {
+    if (queued_bytes_peak_.compare_exchange_weak(
+            peak, new_total,
+            std::memory_order_relaxed, std::memory_order_relaxed)) {
+      break;
+    }
+  }
+}
+
+void WebsocketClient::releaseDequeuedPacketAccounting(
+    const IPPacketPtr& packet) noexcept {
+  if (!packet) {
+    return;
+  }
+  queued_packets_.fetch_sub(1, std::memory_order_relaxed);
+  queued_bytes_.fetch_sub(packet->Data().size(), std::memory_order_relaxed);
+}
+
+SendResult WebsocketClient::Send(fptn::common::network::IPPacketPtr packet) {
+  if (!running_ || !was_connected_) {
+    return SendResult::transport_stopped;
+  }
+  if (!packet || packet->Data().empty()) {
+    return SendResult::invalid_packet;
+  }
+
+  const auto packet_size =
+      static_cast<std::uint64_t>(packet->Data().size());
+
+  // Reserve bytes before try_send. Both bytes and packet count are
+  // reserved before the channel operation so the sender cannot dequeue
+  // and decrement between the two producer increments.
+  const auto reserved_total = tryReserveQueuedBytes(packet_size);
+  if (!reserved_total.has_value()) {
+    queue_full_count_.fetch_add(1, std::memory_order_relaxed);
+    return SendResult::queue_full;
+  }
+
+  queued_packets_.fetch_add(1, std::memory_order_relaxed);
+
+  bool sent = false;
   try {
-    return write_channel_.try_send(
+    sent = write_channel_.try_send(
         boost::system::error_code(), std::move(packet));
   } catch (...) {
-    return false;
+    sent = false;
   }
+
+  if (!sent) {
+    // Rollback both counters on channel-full or exception.
+    queued_packets_.fetch_sub(1, std::memory_order_relaxed);
+    queued_bytes_.fetch_sub(packet_size, std::memory_order_relaxed);
+
+    if (running_ && was_connected_) {
+      queue_full_count_.fetch_add(1, std::memory_order_relaxed);
+      return SendResult::queue_full;
+    }
+    return SendResult::transport_stopped;
+  }
+
+  updateQueuedBytesPeak(*reserved_total);
+  return SendResult::accepted;
 }
 
 bool WebsocketClient::IsStarted() const { return running_ && was_connected_; }
@@ -719,46 +791,86 @@ boost::asio::awaitable<void> WebsocketClient::RunSender() {
   constexpr std::size_t kMaxBatchSize = 32;
   auto token = boost::asio::bind_cancellation_slot(
       cancel_signal_.slot(), boost::asio::as_tuple(boost::asio::use_awaitable));
+
+  // PR1B: append a packet to the batch if it is valid IPv4/IPv6.
+  // Rewrites the source address. Returns the packet's raw size, or 0
+  // if the packet was discarded (non-IP family).
+  auto appendPacketIfValid =
+      [this](fptn::common::network::BatchIPPacketPtr& packets,
+             IPPacketPtr& packet,
+             std::size_t& batch_raw_bytes) -> bool {
+    if (!packet) {
+      return false;
+    }
+    if (packet->IsIPv4()) {
+      packet->SetSrcIPv4Address(assigned_ipv4_);
+    } else if (packet->IsIPv6()) {
+      packet->SetSrcIPv6Address(assigned_ipv6_);
+    } else {
+      return false;
+    }
+    batch_raw_bytes += packet->Data().size();
+    packets.push_back(std::move(packet));
+    return true;
+  };
+
   try {
+    // PR1B: carried packet prevents batch overshoot. When the next
+    // packet would exceed kMaxBatchRawBytes, it is saved here and
+    // becomes the first packet of the next batch.
+    IPPacketPtr pending_packet;
+
     while (running_ && was_connected_ && ws_.is_open()) {
-      fptn::common::network::BatchIPPacketPtr packets;
-      auto [ec, packet] = co_await write_channel_.async_receive(token);
-      if (!ec && packet) {
-        // change addresses
-        if (packet->IsIPv4()) {
-          packet->SetSrcIPv4Address(assigned_ipv4_);
-        } else if (packet->IsIPv6()) {
-          packet->SetSrcIPv6Address(assigned_ipv6_);
-        } else {
+      IPPacketPtr first_packet;
+
+      if (pending_packet) {
+        first_packet = std::move(pending_packet);
+      } else {
+        auto [ec, packet] = co_await write_channel_.async_receive(token);
+        if (ec || !packet) {
           continue;
         }
-
-        packets.push_back(std::move(packet));
-        while (packets.size() < kMaxBatchSize) {
-          const bool has_packet = write_channel_.try_receive(
-              [&packets, this](const boost::system::error_code& ec2,
-                  fptn::common::network::IPPacketPtr p) {
-                if (!ec2 && p) {
-                  // change IP addresses
-                  if (p->IsIPv4()) {
-                    p->SetSrcIPv4Address(assigned_ipv4_);
-                  } else if (p->IsIPv6()) {
-                    p->SetSrcIPv6Address(assigned_ipv6_);
-                  } else {
-                    return;
-                  }
-                  packets.push_back(std::move(p));
-                }
-              });
-          if (!has_packet) {
-            break;
-          }
-        }
+        releaseDequeuedPacketAccounting(packet);
+        first_packet = std::move(packet);
       }
+
+      fptn::common::network::BatchIPPacketPtr packets;
+      std::size_t batch_raw_bytes = 0;
+
+      appendPacketIfValid(packets, first_packet, batch_raw_bytes);
+
+      // Drain additional packets up to packet and byte caps.
+      while (packets.size() < kMaxBatchSize) {
+        IPPacketPtr next_packet;
+        const bool received = write_channel_.try_receive(
+            [&](const boost::system::error_code& ec2,
+                IPPacketPtr p) {
+              if (!ec2) {
+                next_packet = std::move(p);
+              }
+            });
+        if (!received || !next_packet) {
+          break;
+        }
+
+        releaseDequeuedPacketAccounting(next_packet);
+
+        const auto next_size = next_packet->Data().size();
+        if (!packets.empty() &&
+            batch_raw_bytes + next_size > kMaxBatchRawBytes) {
+          // Carry this packet to the next batch to avoid overshoot.
+          pending_packet = std::move(next_packet);
+          break;
+        }
+
+        appendPacketIfValid(packets, next_packet, batch_raw_bytes);
+      }
+
       if (!packets.empty()) {
         auto batch_data = fptn::protocol::yaff::SerializeBatchIPPacket(
             std::move(packets));
         if (batch_data.has_value()) {
+          boost::system::error_code ec;
           co_await ws_.async_write(boost::asio::buffer(batch_data.value()),
               boost::asio::redirect_error(boost::asio::use_awaitable, ec));
           if (ec) {
