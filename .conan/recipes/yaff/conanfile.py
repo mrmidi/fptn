@@ -29,9 +29,15 @@ class YaffConan(ConanFile):
         self.tool_requires("protobuf/5.29.3")
 
     def source(self):
+        # PR0: pin YAFF to a specific commit for reproducible builds.
+        # The replace_in_file patches below are tested against this exact
+        # source; a moving main branch could silently break them.
+        _yaff_commit = "d6f74675374b587ce24112c284abd54a92090221"
+        _yaff_sha256 = "904f06b460c82e60b0303a73c7f53f2735c795adb7de8e5d1327fb0ac2987576"
         get(
             self,
-            "https://github.com/yandex/yaff/archive/refs/heads/main.zip",
+            f"https://github.com/yandex/yaff/archive/{_yaff_commit}.tar.gz",
+            sha256=_yaff_sha256,
             strip_root=True,
         )
         replace_in_file(
