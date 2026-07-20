@@ -48,6 +48,49 @@ class YaffConan(ConanFile):
             "#include <string_view>",
             "#include <ostream>\n#include <string_view>",
         )
+        # C++23: libc++ ranges probes .begin() eagerly via the
+        # input_or_output_iterator concept, which instantiates
+        # ArrayIterator<T> before its definition (line ~347). Defer
+        # begin()/end() to out-of-line definitions after ArrayIterator.
+        replace_in_file(
+            self,
+            os.path.join(self.source_folder, "include", "yaff", "array.h"),
+            "    auto begin() const noexcept {\n"
+            "        return typename T::const_iterator(*static_cast<const T*>(this), 0);\n"
+            "    }\n"
+            "\n"
+            "    auto end() const noexcept {\n"
+            "        return typename T::const_iterator(*static_cast<const T*>(this), Size_);\n"
+            "    }",
+            "    auto begin() const noexcept;\n"
+            "    auto end() const noexcept;",
+        )
+        replace_in_file(
+            self,
+            os.path.join(self.source_folder, "include", "yaff", "array.h"),
+            "class ArrayIterator : public BaseArrayIterator<T, ArrayIterator<T>> {\n"
+            "    using Base = BaseArrayIterator<T, ArrayIterator<T>>;\n"
+            "\n"
+            "public:\n"
+            "    using Base::Base;\n"
+            "};",
+            "class ArrayIterator : public BaseArrayIterator<T, ArrayIterator<T>> {\n"
+            "    using Base = BaseArrayIterator<T, ArrayIterator<T>>;\n"
+            "\n"
+            "public:\n"
+            "    using Base::Base;\n"
+            "};\n"
+            "\n"
+            "template <typename T>\n"
+            "auto BaseArray<T>::begin() const noexcept {\n"
+            "    return typename T::const_iterator(*static_cast<const T*>(this), 0);\n"
+            "}\n"
+            "\n"
+            "template <typename T>\n"
+            "auto BaseArray<T>::end() const noexcept {\n"
+            "    return typename T::const_iterator(*static_cast<const T*>(this), Size_);\n"
+            "}",
+        )
 
     def generate(self):
         tc = CMakeToolchain(self)
