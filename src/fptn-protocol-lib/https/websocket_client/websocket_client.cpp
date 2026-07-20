@@ -6,6 +6,16 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 #include "fptn-protocol-lib/https/websocket_client/websocket_client.h"
 
+// PR1A: compile-time socket buffer experiment parameter.
+// 0 = kernel default. Set via CMake: -DFPTN_IOS_SOCKET_BUFFER_BYTES=262144
+#ifndef FPTN_IOS_SOCKET_BUFFER_BYTES
+#define FPTN_IOS_SOCKET_BUFFER_BYTES 0
+#endif
+
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #include <https/utils/change_cipher_spec.h>
 #include <memory>
 #include <string>
@@ -35,8 +45,24 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 namespace fptn::protocol::https {
 
-WebsocketClient::WebsocketClient(Config config, int thread_number)
-    : ioc_(thread_number),
+namespace {
+// PR1A: iOS socket buffer experiment. 0 = kernel default.
+// Subsequent builds test 262144 (256 KiB) and 524288 (512 KiB)
+// via -DFPTN_IOS_SOCKET_BUFFER_BYTES without editing source.
+#if defined(__APPLE__) && TARGET_OS_IOS
+constexpr int kRequestedSocketBufferBytes = FPTN_IOS_SOCKET_BUFFER_BYTES;
+#else
+constexpr int kRequestedSocketBufferBytes = 0;
+#endif
+}  // namespace
+
+// PR1A: process-wide lifecycle counters.
+std::atomic<int> WebsocketClient::live_clients_{0};
+std::atomic<int> WebsocketClient::active_reader_coroutines_{0};
+std::atomic<int> WebsocketClient::active_sender_coroutines_{0};
+
+WebsocketClient::WebsocketClient(Config config, int concurrency_hint)
+    : ioc_(concurrency_hint),
       ctx_(https::utils::CreateNewSslCtx()),
       resolver_(boost::asio::make_strand(ioc_)),
       strand_(boost::asio::make_strand(ioc_)),
@@ -78,6 +104,8 @@ WebsocketClient::WebsocketClient(Config config, int thread_number)
   ws_.read_message_max(256 * 1024);
   ws_.set_option(boost::beast::websocket::stream_base::timeout::suggested(
       boost::beast::role_type::client));
+
+  live_clients_.fetch_add(1, std::memory_order_relaxed);
 }
 
 WebsocketClient::~WebsocketClient() {
@@ -99,6 +127,9 @@ WebsocketClient::~WebsocketClient() {
     SPDLOG_ERROR("Unknown exception while stopping io_context");
   }
   SPDLOG_INFO("WebsocketClient removed");
+  // PR1A: decrement after Stop() and ioc_.stop() complete, so the
+  // counter reflects the client as alive until fully torn down.
+  live_clients_.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void WebsocketClient::Run() {
@@ -281,15 +312,19 @@ boost::asio::awaitable<bool> WebsocketClient::RunInternal() {
       co_return false;
     }
 
-    // Optimize socket buffer sizes
-    try {
-      boost::beast::get_lowest_layer(ws_).socket().set_option(
-          boost::asio::socket_base::receive_buffer_size(1 * 1024 * 1024));
-      boost::beast::get_lowest_layer(ws_).socket().set_option(
-          boost::asio::socket_base::send_buffer_size(1 * 1024 * 1024));
-    } catch (const boost::system::system_error& e) {
-      SPDLOG_WARN("Failed to set socket options: {}", e.what());
-    }
+    // PR1A: commented out for iOS memory optimization testing.
+    // Previously overwrote Connect()'s buffer sizes to 1 MiB after
+    // IP assignment. Socket buffers are now controlled by the
+    // FPTN_IOS_SOCKET_BUFFER_BYTES CMake parameter (applied before
+    // connect in Connect()). Uncomment to restore legacy behavior.
+    // try {
+    //   boost::beast::get_lowest_layer(ws_).socket().set_option(
+    //       boost::asio::socket_base::receive_buffer_size(1 * 1024 * 1024));
+    //   boost::beast::get_lowest_layer(ws_).socket().set_option(
+    //       boost::asio::socket_base::send_buffer_size(1 * 1024 * 1024));
+    // } catch (const boost::system::system_error& e) {
+    //   SPDLOG_WARN("Failed to set socket options: {}", e.what());
+    // }
 
     boost::beast::get_lowest_layer(ws_).expires_after(std::chrono::hours(3));
 
@@ -336,6 +371,35 @@ boost::asio::awaitable<bool> WebsocketClient::Connect() {
     }
 
     // TCP connect
+    // PR1A: pre-open socket and apply buffer sizes before connect so
+    // they may influence TCP receive-window negotiation.
+    {
+      auto& tcp = boost::beast::get_lowest_layer(ws_);
+      auto& sock = tcp.socket();
+      if (!sock.is_open()) {
+        sock.open(boost::asio::ip::tcp::v4(), ec);
+        if (ec) {
+          SPDLOG_ERROR("Socket open error: {}", ec.message());
+          co_return false;
+        }
+      }
+      requested_rcvbuf_bytes_.store(kRequestedSocketBufferBytes, std::memory_order_relaxed);
+      requested_sndbuf_bytes_.store(kRequestedSocketBufferBytes, std::memory_order_relaxed);
+      if (kRequestedSocketBufferBytes > 0) {
+        boost::system::error_code buf_ec;
+        sock.set_option(
+            boost::asio::socket_base::receive_buffer_size(kRequestedSocketBufferBytes), buf_ec);
+        if (buf_ec) {
+          socket_buffer_set_error_count_.fetch_add(1, std::memory_order_relaxed);
+        }
+        buf_ec.clear();
+        sock.set_option(
+            boost::asio::socket_base::send_buffer_size(kRequestedSocketBufferBytes), buf_ec);
+        if (buf_ec) {
+          socket_buffer_set_error_count_.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    }
     co_await boost::beast::get_lowest_layer(ws_).async_connect(
         results, boost::asio::redirect_error(boost::asio::use_awaitable, ec));
     if (ec) {
@@ -358,6 +422,23 @@ boost::asio::awaitable<bool> WebsocketClient::Connect() {
 
     SPDLOG_INFO("Successfully connected to {}:{}",
         remote_ep.address().to_string(), remote_ep.port());
+
+    // PR1A: query effective socket buffer sizes after connect.
+    // Uses Boost.Asio get_option for cross-platform compatibility.
+    // Failure stores 0; never fails the tunnel.
+    {
+      boost::system::error_code option_ec;
+      boost::asio::socket_base::receive_buffer_size receive_option;
+      socket.get_option(receive_option, option_ec);
+      effective_rcvbuf_bytes_.store(
+          option_ec ? 0 : receive_option.value(), std::memory_order_relaxed);
+
+      option_ec.clear();
+      boost::asio::socket_base::send_buffer_size send_option;
+      socket.get_option(send_option, option_ec);
+      effective_sndbuf_bytes_.store(
+          option_ec ? 0 : send_option.value(), std::memory_order_relaxed);
+    }
 
     // TCP options
     socket.set_option(boost::asio::ip::tcp::no_delay(true));
@@ -404,16 +485,20 @@ boost::asio::awaitable<bool> WebsocketClient::Connect() {
     }
 #endif
 
-    // Optimize socket buffers
-    try {
-      constexpr int kBufferSize = 4 * 1024 * 1024;
-      socket.set_option(
-          boost::asio::socket_base::receive_buffer_size(kBufferSize));
-      socket.set_option(
-          boost::asio::socket_base::send_buffer_size(kBufferSize));
-    } catch (...) {
-      SPDLOG_WARN("Failed to set socket buffer sizes in Connect()");
-    }
+    // PR1A: commented out for iOS memory optimization testing.
+    // Previously requested 4 MiB TCP send/receive buffers here (after
+    // connect). Socket buffers are now controlled by the
+    // FPTN_IOS_SOCKET_BUFFER_BYTES CMake parameter and applied before
+    // connect. Uncomment to restore legacy behavior.
+    // try {
+    //   constexpr int kBufferSize = 4 * 1024 * 1024;
+    //   socket.set_option(
+    //       boost::asio::socket_base::receive_buffer_size(kBufferSize));
+    //   socket.set_option(
+    //       boost::asio::socket_base::send_buffer_size(kBufferSize));
+    // } catch (...) {
+    //   SPDLOG_WARN("Failed to set socket buffer sizes in Connect()");
+    // }
 
     // Reality Mode: Enhanced stealth connection protocol
     // First, establishes a genuine TLS handshake as a decoy to bypass deep
@@ -571,8 +656,11 @@ boost::asio::awaitable<bool> WebsocketClient::ReceiveIPAssignment() {
 }
 
 boost::asio::awaitable<void> WebsocketClient::RunReader() {
+  AtomicActivityGuard guard(active_reader_coroutines_);
   boost::beast::flat_buffer buffer;
-  buffer.reserve(4 * 1024 * 1024);
+  // PR1A: 64 KiB initial reserve with a 256 KiB WebSocket message limit.
+  // Beast grows the buffer dynamically up to read_message_max as needed.
+  buffer.reserve(64 * 1024);
   // cppcheck-suppress variableScope
   std::size_t inbound_batches = 0;  // [diag] persists across the read loop
   try {
@@ -627,6 +715,7 @@ boost::asio::awaitable<void> WebsocketClient::RunReader() {
 }
 
 boost::asio::awaitable<void> WebsocketClient::RunSender() {
+  AtomicActivityGuard guard(active_sender_coroutines_);
   constexpr std::size_t kMaxBatchSize = 32;
   auto token = boost::asio::bind_cancellation_slot(
       cancel_signal_.slot(), boost::asio::as_tuple(boost::asio::use_awaitable));

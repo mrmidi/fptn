@@ -37,12 +37,15 @@ class FPTN(ConanFile):
         "setup": [True, False],
         "with_gui_client": [True, False],
         "build_only_fptn_lib": [True, False],
+        "ios_socket_buffer_bytes": [0, 262144, 524288],
     }
     default_options = {
         # --- program ---
         "setup": False,
         "with_gui_client": False,
         "build_only_fptn_lib": False,
+        # PR1A: iOS socket buffer experiment. 0 = kernel default.
+        "ios_socket_buffer_bytes": 0,
         # -- depends --
         "*:fPIC": True,
         "*:shared": False,
@@ -142,6 +145,10 @@ class FPTN(ConanFile):
     def generate(self):
         tc = CMakeToolchain(self)
         tc.variables["FPTN_VERSION"] = FPTN_VERSION
+        # PR1A: pass iOS socket buffer experiment value to CMake.
+        tc.variables["FPTN_IOS_SOCKET_BUFFER_BYTES"] = str(
+            self.options.ios_socket_buffer_bytes
+        )
         if self.options.with_gui_client:
             tc.variables["FPTN_BUILD_WITH_GUI_CLIENT"] = "True"
         if self.options.build_only_fptn_lib:

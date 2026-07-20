@@ -6,6 +6,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -59,7 +60,10 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
     OnIPRecvPacketCallback new_ip_pkt_callback;
   };
 
-  explicit WebsocketClient(Config config, int thread_number = 4);
+  // PR1A: renamed from thread_number. This is an io_context concurrency
+  // hint, not a thread count — the wrapper runs the context from one
+  // native thread regardless of this value.
+  explicit WebsocketClient(Config config, int concurrency_hint = 1);
 
   virtual ~WebsocketClient();
 
@@ -72,6 +76,16 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
   bool Stop();
   bool Send(fptn::common::network::IPPacketPtr packet);
   bool IsStarted() const;
+
+  // PR1A: read-only numeric diagnostics for the wrapper layer.
+  int GetEffectiveRcvbufBytes() const noexcept { return effective_rcvbuf_bytes_.load(std::memory_order_relaxed); }
+  int GetEffectiveSndbufBytes() const noexcept { return effective_sndbuf_bytes_.load(std::memory_order_relaxed); }
+  int GetRequestedRcvbufBytes() const noexcept { return requested_rcvbuf_bytes_.load(std::memory_order_relaxed); }
+  int GetRequestedSndbufBytes() const noexcept { return requested_sndbuf_bytes_.load(std::memory_order_relaxed); }
+  int GetSocketBufferSetErrorCount() const noexcept { return socket_buffer_set_error_count_.load(std::memory_order_relaxed); }
+  static int GetLiveClients() { return live_clients_.load(std::memory_order_relaxed); }
+  static int GetActiveReaderCoroutines() { return active_reader_coroutines_.load(std::memory_order_relaxed); }
+  static int GetActiveSenderCoroutines() { return active_sender_coroutines_.load(std::memory_order_relaxed); }
 
  protected:
   boost::asio::awaitable<bool> RunInternal();
@@ -87,6 +101,30 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
   std::vector<std::uint8_t> GenerateHandshakePacket() const;
 
  private:
+  // PR1A: process-wide lifecycle counters. Per-client counters cannot
+  // detect an old client still running after replacement; these can.
+  static std::atomic<int> live_clients_;
+  static std::atomic<int> active_reader_coroutines_;
+  static std::atomic<int> active_sender_coroutines_;
+
+  // PR1A: RAII guard for coroutine counters. Handles normal returns,
+  // exceptions, and co_return paths uniformly.
+  class AtomicActivityGuard {
+   public:
+    explicit AtomicActivityGuard(std::atomic<int>& counter)
+        : counter_(counter) {
+      counter_.fetch_add(1, std::memory_order_relaxed);
+    }
+    ~AtomicActivityGuard() {
+      counter_.fetch_sub(1, std::memory_order_relaxed);
+    }
+    AtomicActivityGuard(const AtomicActivityGuard&) = delete;
+    AtomicActivityGuard& operator=(const AtomicActivityGuard&) = delete;
+
+   private:
+    std::atomic<int>& counter_;
+  };
+
   const std::size_t kMaxSizeOutQueue_ = 256;
 
   mutable std::mutex mutex_;
@@ -95,6 +133,17 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
   std::atomic<bool> was_inited_{false};
   std::atomic<bool> was_connected_{false};
   std::atomic<bool> ip_assigned_{false};
+
+  // PR1A: socket buffer diagnostics. Requested = what the build asked for
+  // (0 = kernel default). Effective = what get_option reports after
+  // connect. Failure to set or query stores 0; never fails the tunnel.
+  // Atomic because Connect() writes on the native thread while
+  // getStatus() may read from another queue.
+  std::atomic<int> requested_rcvbuf_bytes_{0};
+  std::atomic<int> requested_sndbuf_bytes_{0};
+  std::atomic<int> effective_rcvbuf_bytes_{0};
+  std::atomic<int> effective_sndbuf_bytes_{0};
+  std::atomic<int> socket_buffer_set_error_count_{0};
 
   boost::asio::io_context ioc_;
   boost::asio::ssl::context ctx_;

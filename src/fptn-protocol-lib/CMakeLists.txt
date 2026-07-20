@@ -126,6 +126,17 @@ set(FPTN_CLIENT_PROTOCOL_SOURCES
 
 add_library("${PROJECT_NAME}_static" STATIC ${FPTN_CLIENT_PROTOCOL_SOURCES})
 
+# PR1A: iOS socket buffer experiment parameter.
+# 0 = kernel default. Test variants:
+#   cmake -DFPTN_IOS_SOCKET_BUFFER_BYTES=262144  (256 KiB)
+#   cmake -DFPTN_IOS_SOCKET_BUFFER_BYTES=524288  (512 KiB)
+set(FPTN_IOS_SOCKET_BUFFER_BYTES 0 CACHE STRING
+    "Requested iOS TCP send/receive buffer size in bytes; 0 uses kernel default")
+if(FPTN_IOS_SOCKET_BUFFER_BYTES GREATER 0)
+  target_compile_definitions("${PROJECT_NAME}_static" PRIVATE
+      FPTN_IOS_SOCKET_BUFFER_BYTES=${FPTN_IOS_SOCKET_BUFFER_BYTES})
+endif()
+
 foreach(target "${PROJECT_NAME}_static")
   if(FPTN_WITH_LIBIDN2)
     set(LIBIDN2_LIB libidn2::libidn2)
