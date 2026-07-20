@@ -58,6 +58,43 @@ inline constexpr std::size_t kMaxBatchRawBytes =
     std::numeric_limits<std::size_t>::max();
 #endif
 
+// PR1C: numeric disconnect diagnostics. Explicit ABI values so C++
+// and Swift raw values match exactly.
+enum class DisconnectCode : std::uint16_t {
+  none = 0,
+  peer_closed = 1,
+  tcp_error = 2,
+  tls_error = 3,
+  websocket_error = 4,
+  watchdog = 5,
+  local_stop = 6,
+  queue_failure = 7,
+  unknown = 255,
+};
+
+enum class StopOrigin : std::uint16_t {
+  none = 0,
+  swift_tunnel_stop = 1,
+  swift_reconnect = 2,
+  native_failure = 3,
+  peer = 4,
+  unknown = 255,
+};
+
+// PR1C: pack code + origin into one uint32 for atomic first-writer-wins.
+constexpr std::uint32_t packTerminalReason(
+    DisconnectCode code, StopOrigin origin) noexcept {
+  return std::uint32_t(code) | (std::uint32_t(origin) << 16);
+}
+
+constexpr DisconnectCode unpackDisconnectCode(std::uint32_t packed) noexcept {
+  return DisconnectCode(packed & 0xFFFF);
+}
+
+constexpr StopOrigin unpackStopOrigin(std::uint32_t packed) noexcept {
+  return StopOrigin(packed >> 16);
+}
+
 using fptn::common::network::IPPacketPtr;
 using fptn::common::network::IPv4Address;
 using fptn::common::network::IPv6Address;
@@ -99,7 +136,12 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
   WebsocketClient& operator=(WebsocketClient&&) = delete;
 
   void Run();
-  bool Stop();
+  // PR1C: request an asynchronous stop. Posts teardown onto the strand;
+  // does not touch Asio/Beast/SSL objects on the caller's thread.
+  // Returns false if a terminal event was already claimed.
+  bool RequestStop(DisconnectCode code, StopOrigin origin);
+  // Convenience for external callers (wrapper).
+  bool Stop(StopOrigin origin = StopOrigin::swift_tunnel_stop);
   // PR1B: typed send result replaces the previous bool return.
   SendResult Send(fptn::common::network::IPPacketPtr packet);
   bool IsStarted() const;
@@ -113,6 +155,12 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
   static int GetLiveClients() { return live_clients_.load(std::memory_order_relaxed); }
   static int GetActiveReaderCoroutines() { return active_reader_coroutines_.load(std::memory_order_relaxed); }
   static int GetActiveSenderCoroutines() { return active_sender_coroutines_.load(std::memory_order_relaxed); }
+  // PR1C: terminal reason diagnostics.
+  std::uint32_t GetTerminalReason() const noexcept { return terminal_reason_.load(std::memory_order_acquire); }
+  DisconnectCode GetDisconnectCode() const noexcept { return unpackDisconnectCode(GetTerminalReason()); }
+  StopOrigin GetStopOrigin() const noexcept { return unpackStopOrigin(GetTerminalReason()); }
+  bool IsStopCleanupCompleted() const noexcept { return stop_cleanup_completed_.load(std::memory_order_acquire); }
+  std::uint32_t GetActiveOperations() const noexcept { return active_operations_.load(std::memory_order_acquire); }
   // PR1B: outbound queue diagnostics.
   std::uint64_t GetQueuedPackets() const noexcept { return queued_packets_.load(std::memory_order_relaxed); }
   std::uint64_t GetQueuedBytes() const noexcept { return queued_bytes_.load(std::memory_order_relaxed); }
@@ -123,12 +171,16 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
   boost::asio::awaitable<bool> RunInternal();
   boost::asio::awaitable<void> RunReader();
   boost::asio::awaitable<void> RunSender();
+  // PR1C: watchdog converted from recursive async_wait to tracked coroutine.
+  boost::asio::awaitable<void> RunWatchdog();
   boost::asio::awaitable<bool> Connect();
   boost::asio::awaitable<bool> ReceiveIPAssignment();
 
   boost::asio::awaitable<bool> PerformFakeHandshake2();
 
-  void StartWatchdog();
+  // PR1C: strand-only teardown. Only this method may touch
+  // Asio/Beast/SSL objects during shutdown.
+  void StopOnExecutor();
 
   std::vector<std::uint8_t> GenerateHandshakePacket() const;
 
@@ -165,6 +217,34 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
   std::atomic<bool> was_inited_{false};
   std::atomic<bool> was_connected_{false};
   std::atomic<bool> ip_assigned_{false};
+
+  // PR1C: operation-tracking barrier. Run() drives the io_context
+  // until stop_cleanup_completed_ && active_operations_ == 0.
+  std::atomic<bool> run_started_{false};
+  std::atomic<bool> stop_requested_{false};
+  std::atomic<bool> stop_cleanup_completed_{false};
+  std::atomic<bool> stop_fallback_pending_{false};
+  std::atomic<std::uint32_t> active_operations_{0};
+
+  // PR1C: packed terminal reason (first-writer-wins via CAS).
+  // Low 16 bits = DisconnectCode, high 16 bits = StopOrigin.
+  // 0 = no terminal event yet.
+  std::atomic<std::uint32_t> terminal_reason_{0};
+
+  bool claimTerminalReason(DisconnectCode code, StopOrigin origin) noexcept {
+    std::uint32_t expected = 0;
+    return terminal_reason_.compare_exchange_strong(
+        expected, packTerminalReason(code, origin),
+        std::memory_order_acq_rel);
+  }
+
+  void trackOperation() noexcept {
+    active_operations_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void completeOperation() noexcept {
+    active_operations_.fetch_sub(1, std::memory_order_release);
+  }
 
   // PR1A: socket buffer diagnostics. Requested = what the build asked for
   // (0 = kernel default). Effective = what get_option reports after

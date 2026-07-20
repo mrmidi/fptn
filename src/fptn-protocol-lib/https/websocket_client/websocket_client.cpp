@@ -109,52 +109,68 @@ WebsocketClient::WebsocketClient(Config config, int concurrency_hint)
 }
 
 WebsocketClient::~WebsocketClient() {
-  try {
-    Stop();
-  } catch (...) {
-    SPDLOG_WARN("Unknown error in ~WebsocketClient");
-  }
-
-  // Stop io_context
+  // PR1C: by the time the destructor fires, Run()'s barrier has
+  // completed and all coroutines have exited. Do NOT call
+  // RequestStop() here — it posts async work that cannot be
+  // processed during destruction. Only perform best-effort cleanup.
   try {
     if (!ioc_.stopped()) {
-      SPDLOG_INFO("Stopping io_context...");
       ioc_.stop();
     }
-  } catch (const boost::system::system_error& err) {
-    SPDLOG_ERROR("Exception while stopping io_context: {}", err.what());
-  } catch (...) {
-    SPDLOG_ERROR("Unknown exception while stopping io_context");
-  }
+  } catch (...) {}
+
   SPDLOG_INFO("WebsocketClient removed");
-  // PR1A: decrement after Stop() and ioc_.stop() complete, so the
-  // counter reflects the client as alive until fully torn down.
   live_clients_.fetch_sub(1, std::memory_order_relaxed);
 }
 
+// PR1C: operation-barrier Run(). Drives the io_context until stop
+// cleanup completes AND all tracked operations finish. Never blocks
+// the io_context thread waiting for its own coroutines.
 void WebsocketClient::Run() {
-  if (running_.exchange(true)) {
-    SPDLOG_WARN("WebsocketClient is already running");
+  if (run_started_.exchange(true)) {
+    SPDLOG_WARN("WebsocketClient::Run() already started");
     return;
   }
+
+  running_ = true;
 
   SPDLOG_INFO("Connecting to {}:{} [strategy={}]", config_.server_ip.ToString(),
       config_.server_port, ToString(config_.censorship_strategy));
 
-  auto self = weak_from_this();
-  boost::asio::co_spawn(
-      ioc_,
-      [self]() -> boost::asio::awaitable<void> {
-        if (auto shared_self = self.lock()) {
-          const bool status = co_await shared_self->RunInternal();
-          if (!status) {
-            shared_self->Stop();
-          }
-        }
-      },
-      boost::asio::detached);
+  // Do NOT reset stop_requested_ or active_operations_ here.
+  // A stop before Run() is preserved.
+  if (!stop_requested_.load(std::memory_order_acquire)) {
+    auto self = shared_from_this();
+    trackOperation();
+    try {
+      boost::asio::co_spawn(
+          ioc_,
+          [self]() -> boost::asio::awaitable<void> {
+            const bool status = co_await self->RunInternal();
+            if (!status) {
+              self->RequestStop(DisconnectCode::unknown, StopOrigin::native_failure);
+            }
+          },
+          [self](std::exception_ptr) {
+            self->completeOperation();
+          });
+    } catch (...) {
+      completeOperation();
+      throw;
+    }
+  }
+
+  // Barrier: drive io_context until cleanup completes and all
+  // tracked operations (root, reader, sender, watchdog, cleanup)
+  // have finished.
   try {
-    while (running_ || !was_stopped_) {
+    while (!stop_cleanup_completed_.load(std::memory_order_acquire) ||
+           active_operations_.load(std::memory_order_acquire) != 0) {
+      // PR1C: if post() failed in RequestStop(), run cleanup
+      // synchronously on this thread (the sole io_context driver).
+      if (stop_fallback_pending_.exchange(false, std::memory_order_acq_rel)) {
+        StopOnExecutor();
+      }
       const std::size_t processed = ioc_.poll_one();
       if (processed == 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -163,22 +179,53 @@ void WebsocketClient::Run() {
   } catch (...) {
     SPDLOG_WARN("Exception while running");
   }
+
+  was_stopped_ = true;
 }
 
-bool WebsocketClient::Stop() {
-  if (!running_) {
+// PR1C: request an asynchronous stop. Posts teardown onto the strand.
+// Does not touch Asio/Beast/SSL objects on the caller's thread.
+bool WebsocketClient::RequestStop(
+    DisconnectCode code, StopOrigin origin) {
+  // Obtain shared_ptr before any other work so a throw here
+  // does not corrupt the operation counter.
+  auto self = shared_from_this();
+
+  if (!claimTerminalReason(code, origin)) {
     return false;
   }
 
-  const std::unique_lock<std::mutex> lock(mutex_);  // mutex
+  SPDLOG_INFO("Stop requested: code={} origin={}",
+      static_cast<int>(code), static_cast<int>(origin));
 
-  // cppcheck-suppress identicalConditionAfterEarlyExit
-  if (!running_) {  // Double-check after acquiring lock
-    return false;
+  stop_requested_.store(true, std::memory_order_release);
+
+  trackOperation();
+  try {
+    boost::asio::post(strand_, [self] {
+      self->StopOnExecutor();
+      self->completeOperation();
+    });
+  } catch (...) {
+    // post() failed (e.g., io_context already stopped). Roll back
+    // the operation and signal the barrier loop to run cleanup
+    // synchronously on the Run() thread.
+    completeOperation();
+    stop_fallback_pending_.store(true, std::memory_order_release);
   }
 
-  SPDLOG_INFO("Marked client as stopped and disconnected");
+  return true;
+}
 
+// PR1C: convenience for external callers (wrapper).
+bool WebsocketClient::Stop(StopOrigin origin) {
+  return RequestStop(DisconnectCode::local_stop, origin);
+}
+
+// PR1C: strand-only teardown. Only this method may touch
+// Asio/Beast/SSL objects during shutdown. No synchronous SSL
+// shutdown — socket closure completes pending operations with errors.
+void WebsocketClient::StopOnExecutor() {
   running_ = false;
   was_connected_ = false;
 
@@ -186,104 +233,44 @@ bool WebsocketClient::Stop() {
 
   try {
     watchdog_timer_.cancel();
-  } catch (const boost::system::system_error&) {
-    SPDLOG_WARN("Cancellation timer error");
-  } catch (...) {
-    SPDLOG_ERROR("Unknown exception while stopping timer");
-  }
+  } catch (...) {}
 
   try {
-    SPDLOG_INFO("Emit cancel signal");
     if (was_inited_) {
       cancel_signal_.emit(boost::asio::cancellation_type::all);
     }
-  } catch (const std::exception&) {
-    SPDLOG_DEBUG("Exception during cancellation");
-  } catch (...) {
-    SPDLOG_ERROR("Unknown exception during cancellation");
-  }
+  } catch (...) {}
 
   try {
-    SPDLOG_INFO("Closing write_channel");
     if (was_inited_) {
       write_channel_.close();
     }
-  } catch (const std::exception&) {
-    SPDLOG_DEBUG("Exception closing write channel");
-  } catch (...) {
-    SPDLOG_ERROR("Unknown exception during closing write channel");
-  }
+  } catch (...) {}
 
   try {
-    SPDLOG_INFO("Closing resolver");
-    if (was_inited_) {
-      resolver_.cancel();
-    }
-  } catch (const std::exception&) {
-    SPDLOG_DEBUG("Exception cancelling resolver");
-  } catch (...) {
-    SPDLOG_ERROR("Unknown exception during closing resolver");
-  }
+    // PR1C: cancel unconditionally — stop-during-DNS-resolution
+    // must cancel the resolver even though was_inited_ is false.
+    resolver_.cancel();
+  } catch (...) {}
 
-  // Close TCP connection
+  // Close socket — completes pending read/write/connect with errors.
   try {
-    if (was_inited_) {
-      SPDLOG_INFO("Shutting down TCP socket...");
-
-      auto& tcp = boost::beast::get_lowest_layer(ws_);
-      const boost::asio::socket_base::linger linger(true, 0);
-      tcp.socket().set_option(linger);
-
-      if (tcp.socket().is_open()) {
-        tcp.socket().shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
-        if (ec && ec != boost::asio::error::not_connected) {
-          SPDLOG_WARN("TCP socket shutdown error: {}", ec.message());
-        } else {
-          SPDLOG_INFO("TCP socket shutdown successfully");
-        }
-
-        tcp.socket().close(ec);
-        if (ec) {
-          SPDLOG_WARN("TCP socket close error: {}", ec.message());
-        } else {
-          SPDLOG_INFO("TCP socket closed successfully");
-        }
-      }
+    auto& socket = boost::beast::get_lowest_layer(ws_).socket();
+    if (socket.is_open()) {
+      socket.cancel(ec);
+      socket.close(ec);
     }
-  } catch (const boost::system::system_error& err) {
-    SPDLOG_ERROR("Exception during TCP shutdown: {}", err.what());
-  } catch (...) {
-    SPDLOG_ERROR("Unknown exception during TCP shutdown");
-  }
+  } catch (...) {}
 
-  // Close SSL
+  // SSL callback cleanup (safe after socket close).
   try {
-    if (was_inited_) {
-      SPDLOG_INFO("Shutting down SSL layer...");
-      auto& ssl = ws_.next_layer();
-      if (ssl.native_handle()) {
-        // More robust SSL shutdown
-        ::SSL_set_quiet_shutdown(ssl.native_handle(), 1);
-        ::SSL_shutdown(ssl.native_handle());
-      }
-      ssl.shutdown(ec);
+    if (auto* ssl = ws_.next_layer().native_handle()) {
+      https::utils::AttachCertificateVerificationCallbackDelete(ssl);
     }
-  } catch (const boost::system::system_error& err) {
-    SPDLOG_ERROR("Exception during SSL shutdown: {}", err.what());
-  } catch (const std::exception& e) {
-    SPDLOG_ERROR("Unexpected exception during SSL shutdown: {}", e.what());
-  } catch (...) {
-    SPDLOG_ERROR("Unknown exception occurred during SSL shutdown");
-  }
+  } catch (...) {}
 
-  if (auto* ssl = ws_.next_layer().native_handle()) {
-    https::utils::AttachCertificateVerificationCallbackDelete(ssl);
-  }
-
-  was_stopped_ = true;
-  SPDLOG_INFO("WebSocket client stopped successfully");
-
-  return true;
+  stop_cleanup_completed_.store(true, std::memory_order_release);
+  SPDLOG_INFO("Stop cleanup completed on executor");
 }
 
 // PR1B: overflow-safe byte reservation via CAS loop.
@@ -400,16 +387,33 @@ boost::asio::awaitable<bool> WebsocketClient::RunInternal() {
 
     boost::beast::get_lowest_layer(ws_).expires_after(std::chrono::hours(3));
 
-    // Start timer
-    StartWatchdog();
-
-    // Start reader and sender
+    // PR1C: spawn reader, sender, and watchdog as tracked operations.
+    // Completion handlers capture shared_from_this() (not raw this).
     was_inited_ = true;
     auto self = shared_from_this();
-    boost::asio::co_spawn(
-        strand_, [self]() { return self->RunReader(); }, boost::asio::detached);
-    boost::asio::co_spawn(
-        strand_, [self]() { return self->RunSender(); }, boost::asio::detached);
+
+    // PR1C: exception-safe tracked spawn. If co_spawn throws,
+    // the operation counter is rolled back so the barrier can finish.
+    trackOperation();
+    try {
+      boost::asio::co_spawn(
+          strand_, [self]() { return self->RunReader(); },
+          [self](std::exception_ptr) { self->completeOperation(); });
+    } catch (...) { completeOperation(); throw; }
+
+    trackOperation();
+    try {
+      boost::asio::co_spawn(
+          strand_, [self]() { return self->RunSender(); },
+          [self](std::exception_ptr) { self->completeOperation(); });
+    } catch (...) { completeOperation(); throw; }
+
+    trackOperation();
+    try {
+      boost::asio::co_spawn(
+          strand_, [self]() { return self->RunWatchdog(); },
+          [self](std::exception_ptr) { self->completeOperation(); });
+    } catch (...) { completeOperation(); throw; }
 
     SPDLOG_INFO("WebSocket connection established successfully");
     SPDLOG_INFO("Using serializer: yaff");
@@ -439,6 +443,7 @@ boost::asio::awaitable<bool> WebsocketClient::Connect() {
         boost::asio::redirect_error(boost::asio::use_awaitable, ec));
     if (ec) {
       SPDLOG_ERROR("Resolve error: {}", ec.message());
+      RequestStop(DisconnectCode::tcp_error, StopOrigin::native_failure);
       co_return false;
     }
 
@@ -476,6 +481,7 @@ boost::asio::awaitable<bool> WebsocketClient::Connect() {
         results, boost::asio::redirect_error(boost::asio::use_awaitable, ec));
     if (ec) {
       SPDLOG_ERROR("Connect error: {}", ec.message());
+      RequestStop(DisconnectCode::tcp_error, StopOrigin::native_failure);
       co_return false;
     }
 
@@ -748,6 +754,12 @@ boost::asio::awaitable<void> WebsocketClient::RunReader() {
             "RunReader stopped after {} inbound batches: {} [closed={}]",
             inbound_batches, ec.message(),
             ec == boost::beast::websocket::error::closed);
+        // PR1C: classify the disconnect at the failure site.
+        if (ec == boost::beast::websocket::error::closed) {
+          RequestStop(DisconnectCode::peer_closed, StopOrigin::peer);
+        } else {
+          RequestStop(DisconnectCode::websocket_error, StopOrigin::native_failure);
+        }
         break;
       }
 
@@ -779,8 +791,10 @@ boost::asio::awaitable<void> WebsocketClient::RunReader() {
     }
   } catch (const std::exception& e) {
     SPDLOG_ERROR("RunReader exception: {}", e.what());
+    RequestStop(DisconnectCode::websocket_error, StopOrigin::native_failure);
   } catch (...) {
     SPDLOG_ERROR("RunReader unknown exception");
+    RequestStop(DisconnectCode::unknown, StopOrigin::native_failure);
   }
   was_connected_ = false;
   co_return;
@@ -875,6 +889,7 @@ boost::asio::awaitable<void> WebsocketClient::RunSender() {
               boost::asio::redirect_error(boost::asio::use_awaitable, ec));
           if (ec) {
             SPDLOG_ERROR("WebSocket error: {}", ec.message());
+            RequestStop(DisconnectCode::websocket_error, StopOrigin::native_failure);
             break;
           }
         }
@@ -883,11 +898,14 @@ boost::asio::awaitable<void> WebsocketClient::RunSender() {
   } catch (const boost::system::system_error& err) {
     if (err.code() != boost::asio::error::operation_aborted) {
       SPDLOG_ERROR("RunSender error: {}", err.what());
+      RequestStop(DisconnectCode::websocket_error, StopOrigin::native_failure);
     }
   } catch (const std::exception& e) {
     SPDLOG_ERROR("RunSender exception: {}", e.what());
+    RequestStop(DisconnectCode::websocket_error, StopOrigin::native_failure);
   } catch (...) {
     SPDLOG_ERROR("RunSender unknown exception");
+    RequestStop(DisconnectCode::unknown, StopOrigin::native_failure);
   }
   was_connected_ = false;
   co_return;
@@ -965,30 +983,33 @@ boost::asio::awaitable<bool> WebsocketClient::PerformFakeHandshake2() {
   co_return false;
 }
 
-void WebsocketClient::StartWatchdog() {
-  if (!running_) return;
-
+// PR1C: watchdog converted from recursive async_wait to tracked
+// coroutine. Checks every 300ms whether the connection was lost.
+boost::asio::awaitable<void> WebsocketClient::RunWatchdog() {
   constexpr std::chrono::milliseconds kTimeout(300);
-
-  auto weak_self = weak_from_this();
-  watchdog_timer_.expires_after(kTimeout);
-  watchdog_timer_.async_wait([weak_self](const boost::system::error_code& ec) {
-    auto shared_self = weak_self.lock();
-    if (!shared_self) {
-      return;
+  try {
+    while (running_ && was_connected_) {
+      boost::system::error_code ec;
+      watchdog_timer_.expires_after(kTimeout);
+      co_await watchdog_timer_.async_wait(
+          boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+      if (ec == boost::asio::error::operation_aborted) {
+        break;
+      }
+      if (running_ && !was_connected_) {
+        SPDLOG_INFO("Watchdog detected disconnected state");
+        RequestStop(DisconnectCode::watchdog, StopOrigin::native_failure);
+        break;
+      }
     }
-
-    if (ec == boost::asio::error::operation_aborted) {
-      return;
-    }
-
-    if (shared_self->running_ && !shared_self->was_connected_) {
-      SPDLOG_INFO("Watchdog detected disconnected state");
-      shared_self->Stop();
-    } else if (shared_self->running_) {
-      shared_self->StartWatchdog();
-    }
-  });
+  } catch (const std::exception& e) {
+    SPDLOG_ERROR("RunWatchdog exception: {}", e.what());
+    RequestStop(DisconnectCode::watchdog, StopOrigin::native_failure);
+  } catch (...) {
+    SPDLOG_ERROR("RunWatchdog unknown exception");
+    RequestStop(DisconnectCode::unknown, StopOrigin::native_failure);
+  }
+  co_return;
 }
 
 std::vector<std::uint8_t> WebsocketClient::GenerateHandshakePacket() const {
