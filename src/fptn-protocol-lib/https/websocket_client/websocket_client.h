@@ -100,6 +100,8 @@ using fptn::common::network::IPv4Address;
 using fptn::common::network::IPv6Address;
 
 using OnIPRecvPacketCallback = std::function<void(IPPacketPtr packet)>;
+using OnIPRecvPacketBatchCallback =
+    std::function<void(fptn::common::network::BatchIPPacketPtr packets)>;
 
 using OnConnectedCallback = std::function<void()>;
 
@@ -121,6 +123,9 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
     CensorshipStrategy censorship_strategy;
     OnConnectedCallback on_connected_callback;
     OnIPRecvPacketCallback new_ip_pkt_callback;
+    // iOS bridge uses this ownership-preserving callback. The single-packet
+    // callback remains for non-iOS clients that do not use the Swift bridge.
+    OnIPRecvPacketBatchCallback new_ip_pkt_batch_callback;
   };
 
   // PR1A: renamed from thread_number. This is an io_context concurrency
@@ -144,6 +149,9 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
   bool Stop(StopOrigin origin = StopOrigin::swift_tunnel_stop);
   // PR1B: typed send result replaces the previous bool return.
   SendResult Send(fptn::common::network::IPPacketPtr packet);
+  // Validates and reserves bounded queue capacity before allocating/copying
+  // the caller-owned bytes into native packet storage.
+  SendResult TrySendPacketBytes(const std::uint8_t* bytes, std::size_t length);
   bool IsStarted() const;
 
   // PR1A: read-only numeric diagnostics for the wrapper layer.
@@ -273,6 +281,9 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
   // Release accounting for a dequeued packet. Must be called before
   // IP-version validation so discarded packets still release bytes.
   void releaseDequeuedPacketAccounting(const IPPacketPtr& packet) noexcept;
+  bool tryReserveQueuedPacket() noexcept;
+  void releaseQueuedReservation(std::uint64_t packet_size) noexcept;
+  SendResult enqueueReserved(IPPacketPtr packet, std::uint64_t packet_size) noexcept;
 
   boost::asio::io_context ioc_;
   boost::asio::ssl::context ctx_;
