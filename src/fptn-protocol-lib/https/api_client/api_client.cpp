@@ -233,6 +233,7 @@ Headers RealBrowserHeaders() {
 
 template <typename TResult>
 TResult ExecuteWithTimeout(const std::function<TResult()>& operation,
+    const std::function<void()>& cancel_operation,
     int timeout,
     const std::string& operation_name,
     const std::string& handle,
@@ -276,6 +277,7 @@ TResult ExecuteWithTimeout(const std::function<TResult()>& operation,
               end_time - start_time);
 
       state->cancelled = true;
+      cancel_operation();
 
       SPDLOG_WARN("{} [{}] - Timeout after {} ms for server {}", operation_name,
           handle, duration.count(), host);
@@ -313,7 +315,8 @@ ApiClient::ApiClient(
     : host_(host),
       port_(port),
       sni_(host),
-      censorship_strategy_(censorship_strategy) {}  // NOLINT
+      censorship_strategy_(censorship_strategy),
+      cancellation_(std::make_shared<CancellationState>()) {}  // NOLINT
 
 ApiClient::ApiClient(std::string host,
     int port,
@@ -322,7 +325,8 @@ ApiClient::ApiClient(std::string host,
     : host_(std::move(host)),
       port_(port),
       sni_(std::move(sni)),
-      censorship_strategy_(censorship_strategy) {}  // NOLINT
+      censorship_strategy_(censorship_strategy),
+      cancellation_(std::make_shared<CancellationState>()) {}  // NOLINT
 
 ApiClient::ApiClient(std::string host,
     int port,
@@ -335,7 +339,8 @@ ApiClient::ApiClient(std::string host,
       sni_(std::move(sni)),
       expected_md5_fingerprint_(std::move(md5_fingerprint)),
       censorship_strategy_(censorship_strategy),
-      server_name_(std::move(server_name)) {}  // NOLINT
+      server_name_(std::move(server_name)),
+      cancellation_(std::make_shared<CancellationState>()) {}  // NOLINT
 
 std::string ApiClient::ServerLogName() const {
   if (server_name_.empty()) {
@@ -352,12 +357,14 @@ std::string ApiClient::ServerLogHost() const {
 }
 
 Response ApiClient::Get(const std::string& handle, int timeout) const {
+  BeginOperation();
   // NOLINTNEXTLINE(bugprone-exception-escape)
   return ExecuteWithTimeout<Response>(
       // NOLINTNEXTLINE(bugprone-exception-escape)
       [self = *this, handle, timeout]() {
         return self.GetImpl(handle, timeout);
       },
+      [self = *this]() { self.Cancel(); },
       timeout, "GET", handle, host_, Response{"", 608, "Operation timeout"});
 }
 
@@ -365,12 +372,14 @@ Response ApiClient::Post(const std::string& handle,
     const std::string& request,
     const std::string& content_type,
     int timeout) const {
+  BeginOperation();
   // NOLINTNEXTLINE(bugprone-exception-escape)
   return ExecuteWithTimeout<Response>(
       // NOLINTNEXTLINE(bugprone-exception-escape)
       [self = *this, handle, request, content_type, timeout]() {
         return self.PostImpl(handle, request, content_type, timeout);
       },
+      [self = *this]() { self.Cancel(); },
       timeout, "POST", handle, host_, Response{"", 608, "Operation timeout"});
 }
 
@@ -494,13 +503,47 @@ boost::asio::awaitable<Response> ApiClient::AsyncPost(const std::string& handle,
 }
 
 bool ApiClient::TestHandshake(int timeout) const {
+  BeginOperation();
   // NOLINTNEXTLINE(bugprone-exception-escape)
   return ExecuteWithTimeout<bool>(
       // NOLINTNEXTLINE(bugprone-exception-escape)
       [self = *this, timeout]() {
         return self.TestHandshakeImpl(timeout);
       },
+      [self = *this]() { self.Cancel(); },
       timeout, "TestHandshake", "", host_, false);
+}
+
+void ApiClient::BeginOperation() const {
+  const std::scoped_lock lock(cancellation_->mutex);
+  cancellation_->cancelled = false;
+  cancellation_->cancel_operation = nullptr;
+}
+
+void ApiClient::RegisterCancellation(std::function<void()> operation) const {
+  const std::scoped_lock lock(cancellation_->mutex);
+  if (cancellation_->cancelled) {
+    operation();
+  } else {
+    cancellation_->cancel_operation = std::move(operation);
+  }
+}
+
+void ApiClient::ClearCancellation() const {
+  const std::scoped_lock lock(cancellation_->mutex);
+  cancellation_->cancel_operation = nullptr;
+}
+
+void ApiClient::Cancel() const {
+  std::function<void()> operation;
+  {
+    const std::scoped_lock lock(cancellation_->mutex);
+    cancellation_->cancelled = true;
+    operation = cancellation_->cancel_operation;
+  }
+  if (operation) {
+    operation();
+  }
 }
 
 ApiClient ApiClient::Clone() const {
@@ -587,6 +630,12 @@ Response ApiClient::GetImpl(const std::string& handle, int timeout) const {
     tcp_stream_type tcp_stream(ioc);
     obfuscator_socket_type obfuscator_stream(std::move(tcp_stream), obfuscator);
     ssl_stream_type stream(std::move(obfuscator_stream), ctx);
+    auto& socket = boost::beast::get_lowest_layer(stream).socket();
+    RegisterCancellation([&socket] {
+      boost::system::error_code ignored;
+      socket.cancel(ignored);
+      socket.close(ignored);
+    });
 
     const std::string port_str = std::to_string(port_);
     auto resolve_result = fptn::common::network::ResolveWithTimeout(
@@ -612,7 +661,6 @@ Response ApiClient::GetImpl(const std::string& handle, int timeout) const {
 
       SPDLOG_INFO("GET [{}] - Successfully connected to {}", handle, host_);
 
-      auto& socket = boost::beast::get_lowest_layer(stream).socket();
       SetSocketTimeouts(socket, timeout);
 
       // Perform fake handshake if enabled
@@ -708,6 +756,7 @@ Response ApiClient::GetImpl(const std::string& handle, int timeout) const {
   if (ssl) {
     utils::AttachCertificateVerificationCallbackDelete(ssl);
   }
+  ClearCancellation();
 
   const auto end_time = std::chrono::steady_clock::now();
   const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -755,6 +804,12 @@ Response ApiClient::PostImpl(const std::string& handle,
     tcp_stream_type tcp_stream(ioc);
     obfuscator_socket_type obfuscator_stream(std::move(tcp_stream), obfuscator);
     ssl_stream_type stream(std::move(obfuscator_stream), ctx);
+    auto& socket = boost::beast::get_lowest_layer(stream).socket();
+    RegisterCancellation([&socket] {
+      boost::system::error_code ignored;
+      socket.cancel(ignored);
+      socket.close(ignored);
+    });
 
     const std::string port_str = std::to_string(port_);
     auto resolve_result = fptn::common::network::ResolveWithTimeout(
@@ -780,7 +835,6 @@ Response ApiClient::PostImpl(const std::string& handle,
 
       SPDLOG_INFO("POST [{}] - Successfully connected to {}", handle, ServerLogHost());
 
-      auto& socket = boost::beast::get_lowest_layer(stream).socket();
       SetSocketTimeouts(socket, timeout);
 
       // Perform fake handshake if enabled
@@ -883,6 +937,7 @@ Response ApiClient::PostImpl(const std::string& handle,
   if (ssl) {
     utils::AttachCertificateVerificationCallbackDelete(ssl);
   }
+  ClearCancellation();
 
   const auto end_time = std::chrono::steady_clock::now();
   const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(

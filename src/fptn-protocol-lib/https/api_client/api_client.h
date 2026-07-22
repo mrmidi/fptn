@@ -6,7 +6,10 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 #pragma once
 
+#include <atomic>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -77,6 +80,7 @@ class ApiClient {
       const std::string& content_type = "application/json",
       int timeout = 5) const;
   bool TestHandshake(int timeout = 5) const;
+  void Cancel() const;
 
  protected:
   ApiClient Clone() const;
@@ -98,12 +102,23 @@ class ApiClient {
   std::vector<std::uint8_t> GenerateHandshakePacket() const;
 
  private:
+  struct CancellationState {
+    std::atomic<bool> cancelled{false};
+    std::mutex mutex;
+    std::function<void()> cancel_operation;
+  };
+
+  void BeginOperation() const;
+  void RegisterCancellation(std::function<void()> operation) const;
+  void ClearCancellation() const;
+
   const std::string host_;
   const int port_;
   const std::string sni_;
   const std::string expected_md5_fingerprint_;
   const CensorshipStrategy censorship_strategy_;
   const std::string server_name_;
+  std::shared_ptr<CancellationState> cancellation_;
 };
 
 using HttpsClientPtr = std::unique_ptr<ApiClient>;
