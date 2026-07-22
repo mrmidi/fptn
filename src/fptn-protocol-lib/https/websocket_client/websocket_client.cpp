@@ -949,11 +949,12 @@ boost::asio::awaitable<void> WebsocketClient::RunSender() {
       }
 
       if (!packets.empty()) {
-        auto batch_data = fptn::protocol::yaff::SerializeBatchIPPacket(
+        auto batch_data = fptn::protocol::yaff::SerializeBatchIPPacketOwned(
             std::move(packets));
         if (batch_data.has_value()) {
           boost::system::error_code ec;
-          co_await ws_.async_write(boost::asio::buffer(batch_data.value()),
+          co_await ws_.async_write(boost::asio::buffer(
+              batch_data->data(), batch_data->size()),
               boost::asio::redirect_error(boost::asio::use_awaitable, ec));
           if (ec) {
             SPDLOG_ERROR("WebSocket error: {}", ec.message());

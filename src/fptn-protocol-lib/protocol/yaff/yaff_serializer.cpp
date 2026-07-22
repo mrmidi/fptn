@@ -40,6 +40,17 @@ bool HasValidYaffRootOffset(const std::uint8_t* data, std::size_t size) {
 
 ProtoPayloadOpt SerializeBatchIPPacket(
     common::network::BatchIPPacketPtr packets) {
+  auto owned = SerializeBatchIPPacketOwned(std::move(packets));
+  if (!owned) {
+    return std::nullopt;
+  }
+  ProtoPayload result(owned->size());
+  std::memcpy(result.data(), owned->data(), owned->size());
+  return result;
+}
+
+std::optional<SerializedPacketBatch> SerializeBatchIPPacketOwned(
+    common::network::BatchIPPacketPtr packets) {
   if (packets.empty()) {
     return std::nullopt;
   }
@@ -97,15 +108,13 @@ ProtoPayloadOpt SerializeBatchIPPacket(
     return std::nullopt;
   }
 
-  const auto buffer = ::yaff::Serialize<YaffMessage>(message);
+  auto buffer = ::yaff::Serialize<YaffMessage>(message);
   if (buffer.Size() == 0) {
     SPDLOG_ERROR("Failed to serialize yaff BatchIPPacket");
     return std::nullopt;
   }
 
-  ProtoPayload result(buffer.Size());
-  std::memcpy(result.data(), buffer.Data(), buffer.Size());
-  return result;
+  return SerializedPacketBatch(std::move(buffer));
 }
 
 BatchProtoPayload DeserializeBatchIPPacket(

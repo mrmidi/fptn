@@ -34,3 +34,9 @@ set(LIBS
 add_executable(ApiClientTest api_client/ApiClientTest.cpp)
 target_link_libraries(ApiClientTest PRIVATE ${LIBS})
 add_test(NAME ApiClientTest COMMAND ApiClientTest)
+
+# PR5: verify the move-owned YAFF frame is byte-identical to the legacy
+# vector-returning serializer for deterministic packet fixtures.
+add_executable(PacketSerializerTest protocol/PacketSerializerTest.cpp)
+target_link_libraries(PacketSerializerTest PRIVATE ${LIBS})
+add_test(NAME PacketSerializerTest COMMAND PacketSerializerTest)
