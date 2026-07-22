@@ -61,7 +61,11 @@ class ApiClient {
       int port,
       std::string sni,
       std::string md5_fingerprint,
-      CensorshipStrategy censorship_strategy);
+      CensorshipStrategy censorship_strategy,
+      std::string server_name = "");
+
+  std::string ServerLogName() const;
+  std::string ServerLogHost() const;
 
   Response Get(const std::string& handle, int timeout = 5) const;
   Response Post(const std::string& handle,
@@ -99,6 +103,7 @@ class ApiClient {
   const std::string sni_;
   const std::string expected_md5_fingerprint_;
   const CensorshipStrategy censorship_strategy_;
+  const std::string server_name_;
 };
 
 using HttpsClientPtr = std::unique_ptr<ApiClient>;

@@ -288,6 +288,18 @@ TResult ExecuteWithTimeout(const std::function<TResult()>& operation,
   return timeout_result;
 }
 
+std::string CleanErrorMessage(const std::string& msg) {
+  auto pos = msg.find(" [system:");
+  if (pos != std::string::npos) {
+    return msg.substr(0, pos);
+  }
+  pos = msg.find(" at /");
+  if (pos != std::string::npos) {
+    return msg.substr(0, pos);
+  }
+  return msg;
+}
+
 };  // namespace
 
 namespace fptn::protocol::https {
@@ -316,12 +328,28 @@ ApiClient::ApiClient(std::string host,
     int port,
     std::string sni,
     std::string md5_fingerprint,
-    CensorshipStrategy censorship_strategy)
+    CensorshipStrategy censorship_strategy,
+    std::string server_name)
     : host_(std::move(host)),
       port_(port),
       sni_(std::move(sni)),
       expected_md5_fingerprint_(std::move(md5_fingerprint)),
-      censorship_strategy_(censorship_strategy) {}  // NOLINT
+      censorship_strategy_(censorship_strategy),
+      server_name_(std::move(server_name)) {}  // NOLINT
+
+std::string ApiClient::ServerLogName() const {
+  if (server_name_.empty()) {
+    return fmt::format("{}:{}", host_, port_);
+  }
+  return fmt::format("{} ({}:{})", server_name_, host_, port_);
+}
+
+std::string ApiClient::ServerLogHost() const {
+  if (server_name_.empty()) {
+    return host_;
+  }
+  return fmt::format("{} ({})", server_name_, host_);
+}
 
 Response ApiClient::Get(const std::string& handle, int timeout) const {
   // NOLINTNEXTLINE(bugprone-exception-escape)
@@ -733,13 +761,13 @@ Response ApiClient::PostImpl(const std::string& handle,
         ioc, host_, port_str, timeout);
 
     if (!resolve_result) {
-      error = resolve_result.error.message();
+      error = CleanErrorMessage(resolve_result.error.message());
       respcode = 603;
-      SPDLOG_ERROR("POST [{}] - DNS resolution failed for {}:{}: {}", handle,
-          host_, port_, error);
+      SPDLOG_ERROR("POST [{}] - DNS resolution failed for {}: {}", handle,
+          ServerLogName(), error);
     } else {
-      SPDLOG_INFO("POST [{}] - Connecting to server: {}:{} [strategy={}]",
-          handle, host_, port_, ToString(censorship_strategy_));
+      SPDLOG_INFO("POST [{}] - Connecting to server: {} [strategy={}]",
+          handle, ServerLogName(), ToString(censorship_strategy_));
 
       boost::beast::get_lowest_layer(stream).expires_after(
           std::chrono::seconds(timeout));
@@ -750,7 +778,7 @@ Response ApiClient::PostImpl(const std::string& handle,
           resolve_result.results);
       server_ip = connected_endpoint.address().to_string();
 
-      SPDLOG_INFO("POST [{}] - Successfully connected to {}", handle, host_);
+      SPDLOG_INFO("POST [{}] - Successfully connected to {}", handle, ServerLogHost());
 
       auto& socket = boost::beast::get_lowest_layer(stream).socket();
       SetSocketTimeouts(socket, timeout);
@@ -760,7 +788,7 @@ Response ApiClient::PostImpl(const std::string& handle,
         const bool perform_status = PerformFakeHandshake2(socket);
         if (!perform_status) {
           SPDLOG_ERROR(
-              "POST [{}] - Fake handshake failed for server {}", handle, host_);
+              "POST [{}] - Fake handshake failed for server {}", handle, ServerLogHost());
           throw std::runtime_error("Fake handshake failed");
         }
         // For Reality Mode we use TLS obfuscator after fake handshake
@@ -825,32 +853,32 @@ Response ApiClient::PostImpl(const std::string& handle,
       } catch (boost::system::system_error const& e) {
         SPDLOG_ERROR(
             "POST [{}] - Exception during connection close for server {}: {}",
-            handle, host_, e.what());
+            handle, ServerLogHost(), CleanErrorMessage(e.what()));
       }
     }
   } catch (const boost::system::system_error& err) {
 #ifdef _WIN32
-    error = boost::nowide::narrow(boost::nowide::widen(err.what()));
+    error = CleanErrorMessage(boost::nowide::narrow(boost::nowide::widen(err.what())));
 #else
-    error = err.what();
+    error = CleanErrorMessage(err.what());
 #endif
     respcode = 600;
     SPDLOG_ERROR("POST [{}] - System error for server {} (IP: {}): {}", handle,
-        host_, server_ip, error);
+        ServerLogHost(), server_ip, error);
   } catch (const std::exception& e) {
 #ifdef _WIN32
-    error = boost::nowide::narrow(boost::nowide::widen(e.what()));
+    error = CleanErrorMessage(boost::nowide::narrow(boost::nowide::widen(e.what())));
 #else
-    error = e.what();
+    error = CleanErrorMessage(e.what());
 #endif
     respcode = 601;
     SPDLOG_ERROR("POST [{}] - Exception for server {} (IP: {}): {}", handle,
-        host_, server_ip, error);
+        ServerLogHost(), server_ip, error);
   } catch (...) {
     error = "Unknown exception";
     respcode = 602;
     SPDLOG_ERROR("POST [{}] - Unknown exception for server {} (IP: {})", handle,
-        host_, server_ip);
+        ServerLogHost(), server_ip);
   }
   if (ssl) {
     utils::AttachCertificateVerificationCallbackDelete(ssl);
@@ -864,13 +892,13 @@ Response ApiClient::PostImpl(const std::string& handle,
     SPDLOG_INFO(
         "POST [{}] - Success from server {} (IP: {}) in {} ms - Status: {}, "
         "Request: {} bytes, Response: {} bytes",
-        handle, host_, server_ip, duration.count(), respcode, request.size(),
+        handle, ServerLogHost(), server_ip, duration.count(), respcode, request.size(),
         body.size());
   } else {
     SPDLOG_WARN(
         "POST [{}] - Failed from server {} (IP: {}) in {} ms - Status: {}, "
         "Error: {}, Request: {} bytes, Response: {} bytes",
-        handle, host_, server_ip, duration.count(), respcode, error,
+        handle, ServerLogHost(), server_ip, duration.count(), respcode, error,
         request.size(), body.size());
   }
   return {body, respcode, error};
@@ -1042,12 +1070,9 @@ bool ApiClient::onVerifyCertificate(
   if (md5_fingerprint == expected_md5_fingerprint_) {
     return true;
   }
-  error = fmt::format(
-      "Certificate MD5 mismatch. Expected: {}, got: {}. "
-      "Please update your token.",
-      expected_md5_fingerprint_, md5_fingerprint);
+  error = "Probably outdated token";
   SPDLOG_ERROR(
-      "Certificate verification failed for server {}: {}", host_, error);
+      "Certificate verification failed for server {}: {}", ServerLogHost(), error);
   return false;
 }
 
