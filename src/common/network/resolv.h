@@ -105,6 +105,10 @@ inline ResolveResult ResolveWithTimeout(boost::asio::io_context& ioc,
   ioc.restart();
   while (!operation_completed) {
     ioc.run_one();
+    if (ioc.stopped() && !operation_completed) {
+      result.error = boost::asio::error::operation_aborted;
+      operation_completed = true;
+    }
   }
   return result;
 }

@@ -631,8 +631,9 @@ Response ApiClient::GetImpl(const std::string& handle, int timeout) const {
     obfuscator_socket_type obfuscator_stream(std::move(tcp_stream), obfuscator);
     ssl_stream_type stream(std::move(obfuscator_stream), ctx);
     auto& socket = boost::beast::get_lowest_layer(stream).socket();
-    RegisterCancellation([&socket] {
+    RegisterCancellation([&ioc, &socket] {
       boost::system::error_code ignored;
+      ioc.stop();
       socket.cancel(ignored);
       socket.close(ignored);
     });
@@ -805,8 +806,9 @@ Response ApiClient::PostImpl(const std::string& handle,
     obfuscator_socket_type obfuscator_stream(std::move(tcp_stream), obfuscator);
     ssl_stream_type stream(std::move(obfuscator_stream), ctx);
     auto& socket = boost::beast::get_lowest_layer(stream).socket();
-    RegisterCancellation([&socket] {
+    RegisterCancellation([&ioc, &socket] {
       boost::system::error_code ignored;
+      ioc.stop();
       socket.cancel(ignored);
       socket.close(ignored);
     });
