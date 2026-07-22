@@ -380,38 +380,62 @@ SendResult WebsocketClient::Send(fptn::common::network::IPPacketPtr packet) {
 SendResult WebsocketClient::TrySendPacketBytes(
     const std::uint8_t* bytes, std::size_t length) {
   if (!running_ || !was_connected_) {
+    outbound_rejected_before_copy_packets_.fetch_add(1, std::memory_order_relaxed);
+    outbound_rejected_before_copy_bytes_.fetch_add(length, std::memory_order_relaxed);
     return SendResult::transport_stopped;
   }
   // This is deliberately a header-only admission check: it prevents an
   // allocation for malformed/non-IP input without duplicating packet parsing.
   if (!bytes || length < 20 ||
       ((bytes[0] >> 4) != 4 && ((bytes[0] >> 4) != 6 || length < 40))) {
+    outbound_rejected_before_copy_packets_.fetch_add(1, std::memory_order_relaxed);
+    outbound_rejected_before_copy_bytes_.fetch_add(length, std::memory_order_relaxed);
     return SendResult::invalid_packet;
   }
   if (!tryReserveQueuedPacket()) {
+    outbound_rejected_before_copy_packets_.fetch_add(1, std::memory_order_relaxed);
+    outbound_rejected_before_copy_bytes_.fetch_add(length, std::memory_order_relaxed);
     queue_full_count_.fetch_add(1, std::memory_order_relaxed);
     return SendResult::queue_full;
   }
   const auto reserved_total = tryReserveQueuedBytes(length);
   if (!reserved_total) {
     queued_packets_.fetch_sub(1, std::memory_order_relaxed);
+    outbound_rejected_before_copy_packets_.fetch_add(1, std::memory_order_relaxed);
+    outbound_rejected_before_copy_bytes_.fetch_add(length, std::memory_order_relaxed);
     queue_full_count_.fetch_add(1, std::memory_order_relaxed);
     return SendResult::queue_full;
   }
   try {
-    fptn::common::network::IPPacketData storage(length);
-    std::memcpy(storage.data(), bytes, length);
+    fptn::common::network::IPPacketData storage(bytes, bytes + length);
+    outbound_admission_copy_operations_.fetch_add(1, std::memory_order_relaxed);
+    outbound_admission_copy_bytes_.fetch_add(length, std::memory_order_relaxed);
     auto packet = fptn::common::network::IPPacket::Parse(std::move(storage));
     if (!packet) {
       releaseQueuedReservation(length);
       return SendResult::invalid_packet;
     }
     updateQueuedBytesPeak(*reserved_total);
-    return enqueueReserved(std::move(packet), length);
+    const auto result = enqueueReserved(std::move(packet), length);
+    if (result != SendResult::accepted) {
+      outbound_copied_but_rejected_packets_.fetch_add(1, std::memory_order_relaxed);
+      outbound_copied_but_rejected_bytes_.fetch_add(length, std::memory_order_relaxed);
+    }
+    return result;
   } catch (...) {
     releaseQueuedReservation(length);
     return SendResult::invalid_packet;
   }
+}
+
+PacketCopyCounters WebsocketClient::GetPacketCopyCounters() const noexcept {
+  return {
+      outbound_admission_copy_operations_.load(std::memory_order_relaxed),
+      outbound_admission_copy_bytes_.load(std::memory_order_relaxed),
+      outbound_rejected_before_copy_packets_.load(std::memory_order_relaxed),
+      outbound_rejected_before_copy_bytes_.load(std::memory_order_relaxed),
+      outbound_copied_but_rejected_packets_.load(std::memory_order_relaxed),
+      outbound_copied_but_rejected_bytes_.load(std::memory_order_relaxed)};
 }
 
 bool WebsocketClient::IsStarted() const { return running_ && was_connected_; }
@@ -829,11 +853,28 @@ boost::asio::awaitable<void> WebsocketClient::RunReader() {
           fptn::protocol::yaff::DeserializeBatchIPPacket(buffer);
       if (!batch_packets.empty()) {
         fptn::common::network::BatchIPPacketPtr delivered_packets;
-        delivered_packets.reserve(batch_packets.size());
+        delivered_packets.reserve(kMaxInboundBatchPackets);
+        std::size_t delivered_bytes = 0;
+        const auto deliver = [this](fptn::common::network::BatchIPPacketPtr& packets) {
+          if (packets.empty()) return;
+          if (config_.new_ip_pkt_batch_callback) {
+            config_.new_ip_pkt_batch_callback(std::move(packets));
+          } else if (config_.new_ip_pkt_callback) {
+            for (auto& packet : packets) {
+              config_.new_ip_pkt_callback(std::move(packet));
+            }
+          }
+          packets.clear();
+          packets.reserve(kMaxInboundBatchPackets);
+        };
         for (auto& raw_ip_opt : batch_packets) {
           auto packet =
               fptn::common::network::IPPacket::Parse(std::move(raw_ip_opt));
           if (running_ && packet) {
+            const auto packet_bytes = packet->Data().size();
+            if (packet_bytes > kMaxInboundPacketBytes) {
+              continue;
+            }
             // change IP addresses
             if (packet->IsIPv4()) {
               packet->SetDstIPv4Address(config_.tun_interface_address_ipv4);
@@ -842,18 +883,17 @@ boost::asio::awaitable<void> WebsocketClient::RunReader() {
             } else {
               continue;
             }
-            delivered_packets.push_back(std::move(packet));
-          }
-        }
-        if (!delivered_packets.empty()) {
-          if (config_.new_ip_pkt_batch_callback) {
-            config_.new_ip_pkt_batch_callback(std::move(delivered_packets));
-          } else if (config_.new_ip_pkt_callback) {
-            for (auto& packet : delivered_packets) {
-              config_.new_ip_pkt_callback(std::move(packet));
+            if (!delivered_packets.empty() &&
+                (delivered_packets.size() == kMaxInboundBatchPackets ||
+                 delivered_bytes + packet_bytes > kMaxInboundBatchRawBytes)) {
+              deliver(delivered_packets);
+              delivered_bytes = 0;
             }
+            delivered_packets.push_back(std::move(packet));
+            delivered_bytes += packet_bytes;
           }
         }
+        deliver(delivered_packets);
       }
       buffer.consume(buffer.size());
     }

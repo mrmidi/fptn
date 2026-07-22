@@ -48,6 +48,15 @@ enum class SendResult : std::uint8_t {
   invalid_packet = 3,
 };
 
+struct PacketCopyCounters {
+  std::uint64_t outbound_admission_copy_operations{0};
+  std::uint64_t outbound_admission_copy_bytes{0};
+  std::uint64_t outbound_rejected_before_copy_packets{0};
+  std::uint64_t outbound_rejected_before_copy_bytes{0};
+  std::uint64_t outbound_copied_but_rejected_packets{0};
+  std::uint64_t outbound_copied_but_rejected_bytes{0};
+};
+
 #if defined(__APPLE__) && TARGET_OS_IOS
 inline constexpr std::uint64_t kMaxQueuedBytes = 256 * 1024;
 inline constexpr std::size_t kMaxBatchRawBytes = 64 * 1024;
@@ -57,6 +66,10 @@ inline constexpr std::uint64_t kMaxQueuedBytes =
 inline constexpr std::size_t kMaxBatchRawBytes =
     std::numeric_limits<std::size_t>::max();
 #endif
+
+inline constexpr std::size_t kMaxInboundBatchPackets = 32;
+inline constexpr std::size_t kMaxInboundBatchRawBytes = 64 * 1024;
+inline constexpr std::size_t kMaxInboundPacketBytes = 64 * 1024;
 
 // PR1C: numeric disconnect diagnostics. Explicit ABI values so C++
 // and Swift raw values match exactly.
@@ -174,6 +187,7 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
   std::uint64_t GetQueuedBytes() const noexcept { return queued_bytes_.load(std::memory_order_relaxed); }
   std::uint64_t GetQueuedBytesPeak() const noexcept { return queued_bytes_peak_.load(std::memory_order_relaxed); }
   std::uint64_t GetQueueFullCount() const noexcept { return queue_full_count_.load(std::memory_order_relaxed); }
+  PacketCopyCounters GetPacketCopyCounters() const noexcept;
 
  protected:
   boost::asio::awaitable<bool> RunInternal();
@@ -272,6 +286,12 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
   std::atomic<std::uint64_t> queued_bytes_{0};
   std::atomic<std::uint64_t> queued_bytes_peak_{0};
   std::atomic<std::uint64_t> queue_full_count_{0};
+  std::atomic<std::uint64_t> outbound_admission_copy_operations_{0};
+  std::atomic<std::uint64_t> outbound_admission_copy_bytes_{0};
+  std::atomic<std::uint64_t> outbound_rejected_before_copy_packets_{0};
+  std::atomic<std::uint64_t> outbound_rejected_before_copy_bytes_{0};
+  std::atomic<std::uint64_t> outbound_copied_but_rejected_packets_{0};
+  std::atomic<std::uint64_t> outbound_copied_but_rejected_bytes_{0};
 
   // PR1B: overflow-safe CAS reservation. Returns the new total on
   // success, nullopt if the byte cap would be exceeded.
