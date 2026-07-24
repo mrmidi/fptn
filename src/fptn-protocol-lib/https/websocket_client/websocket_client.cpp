@@ -825,6 +825,25 @@ boost::asio::awaitable<void> WebsocketClient::RunReader() {
   try {
     boost::system::error_code ec;
     while (running_ && was_connected_ && ws_.is_open()) {
+      // PR6: inbound backpressure. While packetFlow drains slower than the
+      // server sends, leased-but-undrained inbound bytes accumulate (each pins
+      // a native IPPacket). Stop pulling from the socket at/above high-water so
+      // TCP flow control throttles the server; resume once drained below
+      // low-water. The co_await yields the strand (sender/watchdog keep
+      // running); this poll only spins while saturated. Skipped when no
+      // backpressure signal is wired (non-iOS clients).
+      if (config_.inbound_inflight_bytes &&
+          config_.inbound_inflight_bytes() >= kInboundInflightHighWaterBytes) {
+        while (running_ && was_connected_ && ws_.is_open() &&
+               config_.inbound_inflight_bytes() >= kInboundInflightLowWaterBytes) {
+          boost::system::error_code wec;
+          co_await boost::asio::steady_timer{
+              co_await boost::asio::this_coro::executor,
+              std::chrono::milliseconds(1)}
+              .async_wait(boost::asio::redirect_error(
+                  boost::asio::use_awaitable, wec));
+        }
+      }
       co_await ws_.async_read(
           buffer, boost::asio::redirect_error(boost::asio::use_awaitable, ec));
       if (ec) {

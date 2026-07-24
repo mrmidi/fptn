@@ -71,6 +71,16 @@ inline constexpr std::size_t kMaxInboundBatchPackets = 32;
 inline constexpr std::size_t kMaxInboundBatchRawBytes = 64 * 1024;
 inline constexpr std::size_t kMaxInboundPacketBytes = 64 * 1024;
 
+// PR6: inbound in-flight backpressure watermarks. On iOS the parsed native
+// IPPackets are leased to Swift zero-copy and stay alive until packetFlow
+// drains them; under a fast download the reader can outrun packetFlow and pile
+// up leases until jetsam. RunReader stops issuing reads while the leased-but-
+// undrained byte count is at/above the high-water mark and resumes once it
+// falls below the low-water mark, so TCP flow control throttles the server.
+// Only active when Config::inbound_inflight_bytes is set (iOS bridge).
+inline constexpr std::size_t kInboundInflightHighWaterBytes = 2 * 1024 * 1024;
+inline constexpr std::size_t kInboundInflightLowWaterBytes = 1 * 1024 * 1024;
+
 // PR1C: numeric disconnect diagnostics. Explicit ABI values so C++
 // and Swift raw values match exactly.
 enum class DisconnectCode : std::uint16_t {
@@ -139,6 +149,10 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
     // iOS bridge uses this ownership-preserving callback. The single-packet
     // callback remains for non-iOS clients that do not use the Swift bridge.
     OnIPRecvPacketBatchCallback new_ip_pkt_batch_callback;
+    // PR6: optional inbound backpressure signal. When set, returns the current
+    // count of leased-but-undrained inbound bytes so RunReader can pause before
+    // packetFlow's queue grows without bound. Empty for non-iOS clients.
+    std::function<std::size_t()> inbound_inflight_bytes;
   };
 
   // PR1A: renamed from thread_number. This is an io_context concurrency
