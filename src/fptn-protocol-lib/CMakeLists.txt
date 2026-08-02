@@ -105,6 +105,8 @@ set(FPTN_CLIENT_PROTOCOL_SOURCES
     ${YAFF_SRCS}
     https/api_client/api_client.h
     https/api_client/api_client.cpp
+    https/io_runtime/io_runtime.h
+    https/io_runtime/io_runtime.cpp
     https/obfuscator/methods/tls/tls_obfuscator.cpp
     https/obfuscator/methods/tls/tls_obfuscator.h
     https/obfuscator/methods/tls2/tls_obfuscator2.cpp

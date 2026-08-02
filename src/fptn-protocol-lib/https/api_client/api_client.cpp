@@ -6,14 +6,12 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 #include "fptn-protocol-lib/https/api_client/api_client.h"
 
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <iostream>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -32,25 +30,32 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 #pragma warning(disable : 4702)
 #endif
 
+#include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/awaitable.hpp>
+#include <boost/asio/bind_cancellation_slot.hpp>
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/cancel_after.hpp>
+#include <boost/asio/cancellation_signal.hpp>
+#include <boost/asio/co_spawn.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/redirect_error.hpp>
 #include <boost/asio/ssl/detail/openssl_types.hpp>
 #include <boost/asio/ssl/error.hpp>
 #include <boost/asio/ssl/stream.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
+#include <boost/asio/use_future.hpp>
+#include <boost/asio/write.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
-#include <boost/nowide/convert.hpp>
 #include <camouflage/tls/builder.hpp>
 
-#include "common/network/resolv.h"
-
+#include "fptn-protocol-lib/https/io_runtime/io_runtime.h"
 #include "fptn-protocol-lib/https/obfuscator/methods/tls2/tls_obfuscator2.h"
 #include "fptn-protocol-lib/https/obfuscator/tcp_stream/tcp_stream.h"
 #include "fptn-protocol-lib/https/utils/change_cipher_spec.h"
@@ -146,27 +151,6 @@ std::string GetHttpBody(
   return body;
 }
 
-void SetSocketTimeouts(
-    boost::asio::ip::tcp::socket& socket, int timeout_seconds) {
-  auto native_socket = socket.native_handle();
-
-#ifdef _WIN32
-  DWORD timeout_ms = timeout_seconds * 1000;
-  ::setsockopt(native_socket, SOL_SOCKET, SO_RCVTIMEO,
-      reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
-  ::setsockopt(native_socket, SOL_SOCKET, SO_SNDTIMEO,
-      reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
-#else
-  timeval tv = {};
-  tv.tv_sec = timeout_seconds;
-  tv.tv_usec = 0;
-  ::setsockopt(native_socket, SOL_SOCKET, SO_RCVTIMEO,
-      reinterpret_cast<const char*>(&tv), sizeof(tv));
-  ::setsockopt(native_socket, SOL_SOCKET, SO_SNDTIMEO,
-      reinterpret_cast<const char*>(&tv), sizeof(tv));
-#endif
-}
-
 using Headers = std::unordered_map<std::string, std::string>;
 
 Headers RealBrowserHeaders() {
@@ -231,64 +215,6 @@ Headers RealBrowserHeaders() {
 #endif
 }
 
-template <typename TResult>
-TResult ExecuteWithTimeout(const std::function<TResult()>& operation,
-    const std::function<void()>& cancel_operation,
-    int timeout,
-    const std::string& operation_name,
-    const std::string& handle,
-    const std::string& host,
-    const TResult& timeout_result) {
-  try {
-    // Shared state
-    struct SharedState {
-      std::mutex mutex;
-      std::condition_variable cv;
-      bool ready = false;
-      TResult result;
-      std::atomic<bool> cancelled{false};
-    };
-
-    const auto start_time = std::chrono::steady_clock::now();
-
-    auto state = std::make_shared<SharedState>();
-
-    // NOLINTNEXTLINE(bugprone-exception-escape)
-    std::weak_ptr<SharedState> weak_state = state;
-    std::thread([weak_state, operation]() {
-      TResult impl_result = operation();
-      // check state
-      if (auto state = weak_state.lock()) {
-        const std::scoped_lock<std::mutex> lock(state->mutex);
-        if (!state->cancelled) {
-          state->result = impl_result;
-          state->ready = true;
-          state->cv.notify_one();
-        }
-      }
-    }).detach();
-
-    std::unique_lock<std::mutex> lock(state->mutex);  // mutex
-    if (!state->cv.wait_for(lock, std::chrono::seconds(timeout),
-            [state]() { return state->ready; })) {
-      const auto end_time = std::chrono::steady_clock::now();
-      const auto duration =
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              end_time - start_time);
-
-      state->cancelled = true;
-      cancel_operation();
-
-      SPDLOG_WARN("{} [{}] - Timeout after {} ms for server {}", operation_name,
-          handle, duration.count(), host);
-      return timeout_result;
-    }
-    return state->result;
-  } catch (...) {
-    SPDLOG_ERROR("Undefined error: {} {}", operation_name, handle);
-  }
-  return timeout_result;
-}
 
 std::string CleanErrorMessage(const std::string& msg) {
   auto pos = msg.find(" [system:");
@@ -356,31 +282,289 @@ std::string ApiClient::ServerLogHost() const {
   return fmt::format("{} ({})", server_name_, host_);
 }
 
-Response ApiClient::Get(const std::string& handle, int timeout) const {
-  BeginOperation();
-  // NOLINTNEXTLINE(bugprone-exception-escape)
-  return ExecuteWithTimeout<Response>(
-      // NOLINTNEXTLINE(bugprone-exception-escape)
-      [self = *this, handle, timeout]() {
-        return self.GetImpl(handle, timeout);
-      },
-      [self = *this]() { self.Cancel(); },
-      timeout, "GET", handle, host_, Response{"", 608, "Operation timeout"});
+
+namespace {
+
+// Remaining slice of a single overall deadline. Passing the whole timeout to
+// every step would make the worst case N * timeout.
+std::chrono::steady_clock::duration Remaining(
+    std::chrono::steady_clock::time_point deadline) {
+  const auto now = std::chrono::steady_clock::now();
+  return deadline > now ? (deadline - now)
+                        : std::chrono::steady_clock::duration::zero();
 }
 
-Response ApiClient::Post(const std::string& handle,
-    const std::string& request,
-    const std::string& content_type,
-    int timeout) const {
-  BeginOperation();
-  // NOLINTNEXTLINE(bugprone-exception-escape)
-  return ExecuteWithTimeout<Response>(
-      // NOLINTNEXTLINE(bugprone-exception-escape)
-      [self = *this, handle, request, content_type, timeout]() {
-        return self.PostImpl(handle, request, content_type, timeout);
-      },
-      [self = *this]() { self.Cancel(); },
-      timeout, "POST", handle, host_, Response{"", 608, "Operation timeout"});
+}  // namespace
+
+// Owns the whole asio stack for one request. Declaration order matters: `ctx`
+// must outlive `stream`, which holds a reference to it.
+struct ApiClient::Connection {
+  boost::asio::ssl::context ctx;
+  ssl_stream_type stream;
+  SSL* ssl = nullptr;
+  std::string server_ip;
+
+  Connection(const boost::asio::any_io_executor& executor,
+      SSL_CTX* ssl_ctx,
+      obfuscator::IObfuscatorSPtr obfuscator)
+      : ctx(ssl_ctx),
+        stream(obfuscator_socket_type(
+                   tcp_stream_type(executor), std::move(obfuscator)),
+            ctx) {}
+
+  boost::asio::ip::tcp::socket& socket() {
+    return boost::beast::get_lowest_layer(stream).socket();
+  }
+};
+
+boost::asio::awaitable<bool> ApiClient::PerformFakeHandshake(
+    boost::asio::ip::tcp::socket& socket, Deadline deadline) const {
+  try {
+    SPDLOG_INFO("Fake TLS handshake started for SNI: {}", sni_);
+
+    const auto client_hello = GenerateHandshakePacket();
+    if (client_hello.empty()) {
+      SPDLOG_WARN("Failed to generate ClientHello for SNI: {}", sni_);
+      co_return false;
+    }
+
+    boost::system::error_code ec;
+    const std::size_t client_hello_bytes_size =
+        co_await boost::asio::async_write(socket,
+            boost::asio::buffer(client_hello),
+            boost::asio::cancel_after(Remaining(deadline),
+                boost::asio::redirect_error(boost::asio::use_awaitable, ec)));
+    if (ec || client_hello_bytes_size != client_hello.size()) {
+      SPDLOG_ERROR("Error ClientHello sent: {} of {} bytes",
+          client_hello_bytes_size, client_hello.size());
+      co_return false;
+    }
+
+    const auto server_hello =
+        co_await common::network::WaitForServerTlsHelloAsync(
+            socket, std::chrono::milliseconds(1500));
+    if (!server_hello.has_value()) {
+      SPDLOG_ERROR("Failed to receive ServerHello from {}", sni_);
+      co_return false;
+    }
+
+    common::network::CleanSocket(socket);
+
+    const auto change_cipher_spec =
+        fptn::protocol::https::utils::MakeClientChangeCipherSpec();
+    const std::size_t change_cipher_spec_size =
+        co_await boost::asio::async_write(socket,
+            boost::asio::buffer(change_cipher_spec),
+            boost::asio::cancel_after(Remaining(deadline),
+                boost::asio::redirect_error(boost::asio::use_awaitable, ec)));
+    if (ec || change_cipher_spec_size != change_cipher_spec.size()) {
+      SPDLOG_ERROR("Failed to send ChangeCipherSpec to {}: {} of {}", sni_,
+          change_cipher_spec_size, change_cipher_spec.size());
+      co_return false;
+    }
+
+    // Same pacing as the blocking path used, without occupying a thread.
+    boost::asio::steady_timer pacer(co_await boost::asio::this_coro::executor);
+    pacer.expires_after(std::chrono::milliseconds(150));
+    co_await pacer.async_wait(
+        boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+
+    SPDLOG_INFO(
+        "Fake TLS handshake completed for {}, received {} bytes from server",
+        sni_, server_hello.value().size());
+    co_return true;
+  } catch (const std::exception& e) {
+    SPDLOG_ERROR("Fake TLS handshake exception for {}: {}", sni_, e.what());
+  }
+  co_return false;
+}
+
+boost::asio::awaitable<bool> ApiClient::EstablishAsync(Connection& conn,
+    const std::string& log_tag,
+    Deadline deadline,
+    std::string& error,
+    int& respcode) const {
+  boost::system::error_code ec;
+  const auto executor = co_await boost::asio::this_coro::executor;
+
+  boost::asio::ip::tcp::resolver resolver(executor);
+  const auto endpoints = co_await resolver.async_resolve(host_,
+      std::to_string(port_),
+      boost::asio::cancel_after(Remaining(deadline),
+          boost::asio::redirect_error(boost::asio::use_awaitable, ec)));
+  if (ec) {
+    error = CleanErrorMessage(ec.message());
+    respcode = 603;
+    SPDLOG_ERROR("{} - DNS resolution failed for {}: {}", log_tag,
+        ServerLogName(), error);
+    co_return false;
+  }
+
+  SPDLOG_INFO("{} - Connecting to server: {} [strategy={}]", log_tag,
+      ServerLogName(), ToString(censorship_strategy_));
+
+  const auto endpoint = co_await boost::asio::async_connect(conn.socket(),
+      endpoints,
+      boost::asio::cancel_after(Remaining(deadline),
+          boost::asio::redirect_error(boost::asio::use_awaitable, ec)));
+  if (ec) {
+    error = CleanErrorMessage(ec.message());
+    respcode = 600;
+    SPDLOG_ERROR(
+        "{} - Connect failed for {}: {}", log_tag, ServerLogHost(), error);
+    co_return false;
+  }
+  conn.server_ip = endpoint.address().to_string();
+
+  SPDLOG_INFO("{} - Successfully connected to {}", log_tag, ServerLogHost());
+
+  if (IsRealityModeWithFakeHandshake(censorship_strategy_)) {
+    if (!co_await PerformFakeHandshake(conn.socket(), deadline)) {
+      error = "Fake handshake failed";
+      respcode = 600;
+      SPDLOG_ERROR(
+          "{} - Fake handshake failed for server {}", log_tag, ServerLogHost());
+      co_return false;
+    }
+    // For Reality Mode we use TLS obfuscator after fake handshake.
+    // This provides an additional encryption layer for the real connection.
+    conn.stream.next_layer().set_obfuscator(
+        std::make_shared<protocol::https::obfuscator::TlsObfuscator2>());
+  }
+
+  utils::SetHandshakeSessionID(conn.stream.native_handle());
+  utils::SetHandshakeSni(conn.stream.native_handle(), sni_);
+  if (!expected_md5_fingerprint_.empty()) {
+    conn.ssl = conn.stream.native_handle();
+    utils::AttachCertificateVerificationCallback(
+        conn.ssl, [this, &error](const std::string& md5_fingerprint) {
+          return onVerifyCertificate(md5_fingerprint, error);
+        });
+  } else {
+    conn.ctx.set_verify_mode(boost::asio::ssl::verify_none);
+  }
+
+  co_await conn.stream.async_handshake(boost::asio::ssl::stream_base::client,
+      boost::asio::cancel_after(Remaining(deadline),
+          boost::asio::redirect_error(boost::asio::use_awaitable, ec)));
+  if (ec) {
+    if (error.empty()) {
+      error = CleanErrorMessage(ec.message());
+    }
+    respcode = 600;
+    SPDLOG_ERROR("{} - TLS handshake failed for {}: {}", log_tag,
+        ServerLogHost(), error);
+    co_return false;
+  }
+
+  // Reset obfuscator after TLS handshake.
+  conn.stream.next_layer().set_obfuscator(nullptr);
+
+  common::network::CleanSocket(conn.socket());
+  common::network::CleanSsl(conn.ssl);
+
+  boost::asio::steady_timer pacer(executor);
+  pacer.expires_after(std::chrono::milliseconds(150));
+  co_await pacer.async_wait(
+      boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+
+  co_return true;
+}
+
+boost::asio::awaitable<Response> ApiClient::AsyncGet(
+    const std::string& handle, int timeout) const {
+  const auto start_time = std::chrono::steady_clock::now();
+  const Deadline deadline = start_time + std::chrono::seconds(timeout);
+  const std::string log_tag = fmt::format("GET [{}]", handle);
+
+  std::string body;
+  std::string error;
+  int respcode = 400;
+  std::string server_ip;
+
+  try {
+    obfuscator::IObfuscatorSPtr obfuscator = nullptr;
+    if (censorship_strategy_ == CensorshipStrategy::kTlsObfuscator) {
+      obfuscator = std::make_shared<obfuscator::TlsObfuscator2>();
+    }
+    Connection conn(co_await boost::asio::this_coro::executor,
+        utils::CreateNewSslCtx(), std::move(obfuscator));
+
+    if (co_await EstablishAsync(conn, log_tag, deadline, error, respcode)) {
+      server_ip = conn.server_ip;
+      boost::system::error_code ec;
+
+      boost::beast::http::request<boost::beast::http::string_body> req{
+          boost::beast::http::verb::get, handle, 11};
+      req.set(boost::beast::http::field::host, host_);
+      for (const auto& [key, value] : RealBrowserHeaders()) {
+        req.set(key, value);
+      }
+
+      co_await boost::beast::http::async_write(conn.stream, req,
+          boost::asio::cancel_after(Remaining(deadline),
+              boost::asio::redirect_error(boost::asio::use_awaitable, ec)));
+      if (ec) {
+        error = CleanErrorMessage(ec.message());
+        respcode = 600;
+      } else {
+        boost::beast::flat_buffer buffer;
+        boost::beast::http::response<boost::beast::http::dynamic_body> res;
+        co_await boost::beast::http::async_read(conn.stream, buffer, res,
+            boost::asio::cancel_after(Remaining(deadline),
+                boost::asio::redirect_error(boost::asio::use_awaitable, ec)));
+        if (ec) {
+          error = CleanErrorMessage(ec.message());
+          respcode = 600;
+        } else {
+          respcode = static_cast<int>(res.result_int());
+          body = GetHttpBody(res);
+        }
+      }
+
+      // Must not be the blocking shutdown(): it waits for the peer's
+      // close_notify, which parks a shared I/O thread when the peer never
+      // answers. Bounded and asynchronous so a slow peer costs nothing.
+      boost::system::error_code shutdown_ec;
+      co_await conn.stream.async_shutdown(
+          boost::asio::cancel_after(std::chrono::seconds(2),
+              boost::asio::redirect_error(
+                  boost::asio::use_awaitable, shutdown_ec)));
+    } else {
+      server_ip = conn.server_ip;
+    }
+
+    if (conn.ssl) {
+      utils::AttachCertificateVerificationCallbackDelete(conn.ssl);
+    }
+  } catch (const boost::system::system_error& err) {
+    error = CleanErrorMessage(err.what());
+    respcode = 600;
+    SPDLOG_ERROR("{} - System error for server {} (IP: {}): {}", log_tag,
+        ServerLogHost(), server_ip, error);
+  } catch (const std::exception& e) {
+    error = CleanErrorMessage(e.what());
+    respcode = 601;
+    SPDLOG_ERROR("{} - Exception for server {} (IP: {}): {}", log_tag,
+        ServerLogHost(), server_ip, error);
+  }
+
+  const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - start_time);
+  if (respcode >= 200 && respcode < 300) {
+    SPDLOG_INFO(
+        "{} - Success from server {} (IP: {}) in {} ms - Status: {}, "
+        "Body size: {} bytes",
+        log_tag, ServerLogHost(), server_ip, duration.count(), respcode,
+        body.size());
+  } else {
+    SPDLOG_WARN(
+        "{} - Failed from server {} (IP: {}) in {} ms - Status: {}, "
+        "Error: {}, Body size: {} bytes",
+        log_tag, ServerLogHost(), server_ip, duration.count(), respcode, error,
+        body.size());
+  }
+  co_return Response{body, respcode, error};
 }
 
 boost::asio::awaitable<Response> ApiClient::AsyncPost(const std::string& handle,
@@ -388,493 +572,25 @@ boost::asio::awaitable<Response> ApiClient::AsyncPost(const std::string& handle,
     const std::string& content_type,
     int timeout) const {
   const auto start_time = std::chrono::steady_clock::now();
-  std::string error;
-  int respcode = 400;
-  std::string body;
+  const Deadline deadline = start_time + std::chrono::seconds(timeout);
+  const std::string log_tag = fmt::format("POST [{}]", handle);
 
-  auto executor = co_await boost::asio::this_coro::executor;
-
-  auto* ssl_ctx_raw = utils::CreateNewSslCtx();
-  boost::asio::ssl::context ctx(ssl_ctx_raw);
-
-  fptn::protocol::https::obfuscator::IObfuscatorSPtr obfuscator = nullptr;
-  if (censorship_strategy_ == CensorshipStrategy::kTlsObfuscator) {
-    obfuscator =
-        std::make_shared<protocol::https::obfuscator::TlsObfuscator2>();
-  }
-
-  tcp_stream_type tcp_stream(executor);
-  obfuscator_socket_type obfuscator_stream(std::move(tcp_stream), obfuscator);
-  ssl_stream_type stream(std::move(obfuscator_stream), ctx);
-
-  boost::beast::get_lowest_layer(stream).expires_after(
-      std::chrono::seconds(timeout));
-
-  try {
-    boost::asio::ip::tcp::resolver resolver(executor);
-    const std::string port_str = std::to_string(port_);
-    boost::system::error_code ec;
-
-    auto results = co_await resolver.async_resolve(host_, port_str,
-        boost::asio::redirect_error(boost::asio::use_awaitable, ec));
-    if (ec) {
-      SPDLOG_ERROR("AsyncPost [{}] - DNS failed for {}:{}: {}", handle, host_,
-          port_, ec.message());
-      co_return Response{"", 603, ec.message()};
-    }
-
-    co_await boost::beast::get_lowest_layer(stream).async_connect(
-        results, boost::asio::redirect_error(boost::asio::use_awaitable, ec));
-    if (ec) {
-      SPDLOG_ERROR("AsyncPost [{}] - Connect failed for {}: {}", handle, host_,
-          ec.message());
-      co_return Response{"", 600, ec.message()};
-    }
-
-    utils::SetHandshakeSessionID(stream.native_handle());
-    utils::SetHandshakeSni(stream.native_handle(), sni_);
-    ctx.set_verify_mode(boost::asio::ssl::verify_none);
-
-    co_await stream.async_handshake(boost::asio::ssl::stream_base::client,
-        boost::asio::redirect_error(boost::asio::use_awaitable, ec));
-    if (ec) {
-      SPDLOG_ERROR("AsyncPost [{}] - TLS handshake failed for {}: {}", handle,
-          host_, ec.message());
-      co_return Response{"", 600, ec.message()};
-    }
-
-    stream.next_layer().set_obfuscator(nullptr);
-
-    boost::beast::http::request<boost::beast::http::string_body> req{
-        boost::beast::http::verb::post, handle, 11};
-    req.set(boost::beast::http::field::host, host_);
-    req.set(boost::beast::http::field::content_type, content_type);
-    req.body() = request;
-    req.prepare_payload();
-
-    co_await boost::beast::http::async_write(stream, req,
-        boost::asio::redirect_error(boost::asio::use_awaitable, ec));
-    if (ec) {
-      SPDLOG_ERROR("AsyncPost [{}] - Write failed for {}: {}", handle, host_,
-          ec.message());
-      co_return Response{"", 600, ec.message()};
-    }
-
-    boost::beast::flat_buffer buffer;
-    boost::beast::http::response<boost::beast::http::dynamic_body> res;
-    co_await boost::beast::http::async_read(stream, buffer, res,
-        boost::asio::redirect_error(boost::asio::use_awaitable, ec));
-    if (ec) {
-      SPDLOG_ERROR("AsyncPost [{}] - Read failed for {}: {}", handle, host_,
-          ec.message());
-      co_return Response{"", 600, ec.message()};
-    }
-
-    respcode = static_cast<int>(res.result_int());
-    body = GetHttpBody(res);
-
-    boost::system::error_code shutdown_ec;
-    stream.shutdown(shutdown_ec);
-  } catch (const boost::system::system_error& err) {
-    error = err.what();
-    respcode = 600;
-    SPDLOG_ERROR(
-        "AsyncPost [{}] - System error for {}: {}", handle, host_, error);
-  } catch (const std::exception& e) {
-    error = e.what();
-    respcode = 601;
-    SPDLOG_ERROR("AsyncPost [{}] - Exception for {}: {}", handle, host_, error);
-  }
-
-  const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now() - start_time);
-
-  if (respcode >= 200 && respcode < 300) {
-    SPDLOG_INFO(
-        "AsyncPost [{}] - Success from {} in {} ms - Status: {}, "
-        "Response: {} bytes",
-        handle, host_, duration.count(), respcode, body.size());
-  } else {
-    SPDLOG_WARN(
-        "AsyncPost [{}] - Failed from {} in {} ms - Status: {}, Error: {}",
-        handle, host_, duration.count(), respcode, error);
-  }
-  co_return Response{body, respcode, error};
-}
-
-bool ApiClient::TestHandshake(int timeout) const {
-  BeginOperation();
-  // NOLINTNEXTLINE(bugprone-exception-escape)
-  return ExecuteWithTimeout<bool>(
-      // NOLINTNEXTLINE(bugprone-exception-escape)
-      [self = *this, timeout]() {
-        return self.TestHandshakeImpl(timeout);
-      },
-      [self = *this]() { self.Cancel(); },
-      timeout, "TestHandshake", "", host_, false);
-}
-
-void ApiClient::BeginOperation() const {
-  const std::scoped_lock lock(cancellation_->mutex);
-  cancellation_->cancelled = false;
-  cancellation_->cancel_operation = nullptr;
-}
-
-void ApiClient::RegisterCancellation(std::function<void()> operation) const {
-  const std::scoped_lock lock(cancellation_->mutex);
-  if (cancellation_->cancelled) {
-    operation();
-  } else {
-    cancellation_->cancel_operation = std::move(operation);
-  }
-}
-
-void ApiClient::ClearCancellation() const {
-  const std::scoped_lock lock(cancellation_->mutex);
-  cancellation_->cancel_operation = nullptr;
-}
-
-void ApiClient::Cancel() const {
-  std::function<void()> operation;
-  {
-    const std::scoped_lock lock(cancellation_->mutex);
-    cancellation_->cancelled = true;
-    operation = cancellation_->cancel_operation;
-  }
-  if (operation) {
-    operation();
-  }
-}
-
-ApiClient ApiClient::Clone() const {
-  ApiClient temp_client(
-      host_, port_, sni_, expected_md5_fingerprint_, censorship_strategy_);
-  return temp_client;
-}
-
-bool ApiClient::PerformFakeHandshake2(
-    boost::asio::ip::tcp::socket& socket) const {
-  try {
-    SPDLOG_INFO("Fake TLS handshake started for SNI: {}", sni_);
-
-    /* Send client hello */
-    const auto client_hello = GenerateHandshakePacket();
-    if (client_hello.empty()) {
-      SPDLOG_WARN("Failed to generate ClientHello for SNI: {}", sni_);
-      return false;
-    }
-    const std::size_t client_hello_bytes_size =
-        boost::asio::write(socket, boost::asio::buffer(client_hello));
-    if (client_hello_bytes_size != client_hello.size()) {
-      SPDLOG_ERROR("Error ClientHello sent: {} of {} bytes",
-          client_hello_bytes_size, client_hello.size());
-      return false;
-    }
-
-    /* Wait for server answer */
-    const auto server_hello = common::network::WaitForServerTlsHello(
-        socket, std::chrono::milliseconds(1500));
-    if (!server_hello.has_value()) {
-      SPDLOG_ERROR("Failed to receive ServerHello from {}", sni_);
-      return false;
-    }
-
-    // clean
-    common::network::CleanSocket(socket);
-
-    /* Send change cipher spec */
-    const auto change_cipher_spec =
-        fptn::protocol::https::utils::MakeClientChangeCipherSpec();
-    const std::size_t change_cipher_spec_size =
-        boost::asio::write(socket, boost::asio::buffer(change_cipher_spec));
-    if (change_cipher_spec_size != change_cipher_spec.size()) {
-      SPDLOG_ERROR("Failed to send ClientHello to {}: {}",
-          change_cipher_spec_size, change_cipher_spec.size());
-      return false;
-    }
-
-    // timeout
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
-
-    SPDLOG_INFO(
-        "Fake TLS handshake completed for {}, received {} bytes from server",
-        sni_, server_hello.value().size());
-    return true;
-  } catch (const std::exception& e) {
-    SPDLOG_ERROR("Fake TLS handshake exception for {}: {}", sni_, e.what());
-  }
-  return false;
-}
-
-Response ApiClient::GetImpl(const std::string& handle, int timeout) const {
   std::string body;
   std::string error;
   int respcode = 400;
-
-  const auto start_time = std::chrono::steady_clock::now();
-
-  SSL* ssl = nullptr;
   std::string server_ip;
+
   try {
-    boost::asio::io_context ioc;
-
-    auto* ssl_ctx = fptn::protocol::https::utils::CreateNewSslCtx();
-    boost::asio::ssl::context ctx(ssl_ctx);
-
-    fptn::protocol::https::obfuscator::IObfuscatorSPtr obfuscator = nullptr;
+    obfuscator::IObfuscatorSPtr obfuscator = nullptr;
     if (censorship_strategy_ == CensorshipStrategy::kTlsObfuscator) {
-      obfuscator =
-          std::make_shared<fptn::protocol::https::obfuscator::TlsObfuscator2>();
+      obfuscator = std::make_shared<obfuscator::TlsObfuscator2>();
     }
+    Connection conn(co_await boost::asio::this_coro::executor,
+        utils::CreateNewSslCtx(), std::move(obfuscator));
 
-    tcp_stream_type tcp_stream(ioc);
-    obfuscator_socket_type obfuscator_stream(std::move(tcp_stream), obfuscator);
-    ssl_stream_type stream(std::move(obfuscator_stream), ctx);
-    auto& socket = boost::beast::get_lowest_layer(stream).socket();
-    RegisterCancellation([&ioc, &socket] {
-      boost::system::error_code ignored;
-      ioc.stop();
-      socket.cancel(ignored);
-      socket.close(ignored);
-    });
-
-    const std::string port_str = std::to_string(port_);
-    auto resolve_result = fptn::common::network::ResolveWithTimeout(
-        ioc, host_, port_str, timeout);
-
-    if (!resolve_result) {
-      error = resolve_result.error.message();
-      respcode = 603;
-      SPDLOG_ERROR("GET [{}] - DNS resolution failed for {}:{}: {}", handle,
-          host_, port_, error);
-    } else {
-      SPDLOG_INFO("GET [{}] - Connecting to server: {}:{} [strategy={}]",
-          handle, host_, port_, ToString(censorship_strategy_));
-
-      boost::beast::get_lowest_layer(stream).expires_after(
-          std::chrono::seconds(timeout));
-      stream.next_layer().next_layer().expires_after(
-          std::chrono::seconds(timeout));
-
-      auto connected_endpoint = boost::beast::get_lowest_layer(stream).connect(
-          resolve_result.results);
-      server_ip = connected_endpoint.address().to_string();
-
-      SPDLOG_INFO("GET [{}] - Successfully connected to {}", handle, host_);
-
-      SetSocketTimeouts(socket, timeout);
-
-      // Perform fake handshake if enabled
-      if (IsRealityModeWithFakeHandshake(censorship_strategy_)) {
-        const bool perform_status = PerformFakeHandshake2(socket);
-        if (!perform_status) {
-          SPDLOG_ERROR(
-              "GET [{}] - Fake handshake failed for server {}", handle, host_);
-          throw std::runtime_error("Fake handshake failed");
-        }
-        // For Reality Mode we use TLS obfuscator after fake handshake
-        // This provides additional encryption layer for the real connection
-        stream.next_layer().set_obfuscator(
-            std::make_shared<protocol::https::obfuscator::TlsObfuscator2>());
-      }
-
-      utils::SetHandshakeSessionID(stream.native_handle());
-      utils::SetHandshakeSni(stream.native_handle(), sni_);
-      if (!expected_md5_fingerprint_.empty()) {
-        ssl = stream.native_handle();
-        utils::AttachCertificateVerificationCallback(
-            ssl, [this, &error](const std::string& md5_fingerprint) {
-              return onVerifyCertificate(md5_fingerprint, error);
-            });
-      } else {
-        ctx.set_verify_mode(boost::asio::ssl::verify_none);
-      }
-
-      stream.handshake(boost::asio::ssl::stream_base::client);
-
-      // Reset obfuscator after TLS-handshake
-      stream.next_layer().set_obfuscator(nullptr);
-
-      // Clean
-      common::network::CleanSocket(socket);
-      common::network::CleanSsl(ssl);
-      // timeout
-      std::this_thread::sleep_for(std::chrono::milliseconds(150));
-
-      boost::beast::http::request<boost::beast::http::string_body> req{
-          boost::beast::http::verb::get, handle, 11};
-
-      // set http headers
-      const auto headers = RealBrowserHeaders();
-      for (const auto& [key, value] : headers) {
-        req.set(key, value);
-      }
-
-      boost::beast::http::write(stream, req);
-
-      boost::beast::flat_buffer buffer;
-      boost::beast::http::response<boost::beast::http::dynamic_body> res;
-
-      boost::beast::http::read(stream, buffer, res);
-
-      respcode = static_cast<int>(res.result_int());
-      body = GetHttpBody(res);
-
+    if (co_await EstablishAsync(conn, log_tag, deadline, error, respcode)) {
+      server_ip = conn.server_ip;
       boost::system::error_code ec;
-      stream.shutdown(ec);
-      try {
-        boost::beast::get_lowest_layer(stream).close();
-      } catch (boost::system::system_error const& e) {
-        SPDLOG_ERROR(
-            "GET [{}] - Exception during connection close for server {}: {}",
-            handle, host_, e.what());
-      }
-    }
-  } catch (const boost::system::system_error& err) {
-#ifdef _WIN32
-    error = boost::nowide::narrow(boost::nowide::widen(err.what()));
-#else
-    error = err.what();
-#endif
-    respcode = 600;
-    SPDLOG_ERROR("GET [{}] - System error for server {} (IP: {}): {}", handle,
-        host_, server_ip, error);
-  } catch (const std::exception& e) {
-#ifdef _WIN32
-    error = boost::nowide::narrow(boost::nowide::widen(e.what()));
-#else
-    error = e.what();
-#endif
-    respcode = 601;
-    SPDLOG_ERROR("GET [{}] - Exception for server {} (IP: {}): {}", handle,
-        host_, server_ip, error);
-  } catch (...) {
-    error = "Unknown exception";
-    respcode = 602;
-    SPDLOG_ERROR("GET [{}] - Unknown exception for server {} (IP: {})", handle,
-        host_, server_ip);
-  }
-  if (ssl) {
-    utils::AttachCertificateVerificationCallbackDelete(ssl);
-  }
-  ClearCancellation();
-
-  const auto end_time = std::chrono::steady_clock::now();
-  const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-      end_time - start_time);
-
-  if (respcode >= 200 && respcode < 300) {
-    SPDLOG_INFO(
-        "GET [{}] - Success from server {} (IP: {}) in {} ms - Status: {}, "
-        "Body size: {} bytes",
-        handle, host_, server_ip, duration.count(), respcode, body.size());
-  } else {
-    SPDLOG_WARN(
-        "GET [{}] - Failed from server {} (IP: {}) in {} ms - Status: {}, "
-        "Error: {}, Body size: {} bytes",
-        handle, host_, server_ip, duration.count(), respcode, error,
-        body.size());
-  }
-  return {body, respcode, error};
-}
-
-Response ApiClient::PostImpl(const std::string& handle,
-    const std::string& request,
-    const std::string& content_type,
-    int timeout) const {
-  std::string body;
-  std::string error;
-  int respcode = 400;
-
-  const auto start_time = std::chrono::steady_clock::now();
-
-  SSL* ssl = nullptr;
-  std::string server_ip;
-
-  try {
-    boost::asio::io_context ioc;
-    auto* ssl_ctx = utils::CreateNewSslCtx();
-    boost::asio::ssl::context ctx(ssl_ctx);
-
-    fptn::protocol::https::obfuscator::IObfuscatorSPtr obfuscator = nullptr;
-    if (censorship_strategy_ == CensorshipStrategy::kTlsObfuscator) {
-      obfuscator =
-          std::make_shared<fptn::protocol::https::obfuscator::TlsObfuscator2>();
-    }
-
-    tcp_stream_type tcp_stream(ioc);
-    obfuscator_socket_type obfuscator_stream(std::move(tcp_stream), obfuscator);
-    ssl_stream_type stream(std::move(obfuscator_stream), ctx);
-    auto& socket = boost::beast::get_lowest_layer(stream).socket();
-    RegisterCancellation([&ioc, &socket] {
-      boost::system::error_code ignored;
-      ioc.stop();
-      socket.cancel(ignored);
-      socket.close(ignored);
-    });
-
-    const std::string port_str = std::to_string(port_);
-    auto resolve_result = fptn::common::network::ResolveWithTimeout(
-        ioc, host_, port_str, timeout);
-
-    if (!resolve_result) {
-      error = CleanErrorMessage(resolve_result.error.message());
-      respcode = 603;
-      SPDLOG_ERROR("POST [{}] - DNS resolution failed for {}: {}", handle,
-          ServerLogName(), error);
-    } else {
-      SPDLOG_INFO("POST [{}] - Connecting to server: {} [strategy={}]",
-          handle, ServerLogName(), ToString(censorship_strategy_));
-
-      boost::beast::get_lowest_layer(stream).expires_after(
-          std::chrono::seconds(timeout));
-      stream.next_layer().next_layer().expires_after(
-          std::chrono::seconds(timeout));
-
-      auto connected_endpoint = boost::beast::get_lowest_layer(stream).connect(
-          resolve_result.results);
-      server_ip = connected_endpoint.address().to_string();
-
-      SPDLOG_INFO("POST [{}] - Successfully connected to {}", handle, ServerLogHost());
-
-      SetSocketTimeouts(socket, timeout);
-
-      // Perform fake handshake if enabled
-      if (IsRealityModeWithFakeHandshake(censorship_strategy_)) {
-        const bool perform_status = PerformFakeHandshake2(socket);
-        if (!perform_status) {
-          SPDLOG_ERROR(
-              "POST [{}] - Fake handshake failed for server {}", handle, ServerLogHost());
-          throw std::runtime_error("Fake handshake failed");
-        }
-        // For Reality Mode we use TLS obfuscator after fake handshake
-        // This provides additional encryption layer for the real connection
-        stream.next_layer().set_obfuscator(
-            std::make_shared<protocol::https::obfuscator::TlsObfuscator2>());
-      }
-
-      utils::SetHandshakeSessionID(stream.native_handle());
-      utils::SetHandshakeSni(stream.native_handle(), sni_);
-      if (!expected_md5_fingerprint_.empty()) {
-        ssl = stream.native_handle();
-        utils::AttachCertificateVerificationCallback(
-            ssl, [this, &error](const std::string& md5_fingerprint) {
-              return onVerifyCertificate(md5_fingerprint, error);
-            });
-      } else {
-        ctx.set_verify_mode(boost::asio::ssl::verify_none);
-      }
-
-      stream.handshake(boost::asio::ssl::stream_base::client);
-
-      // Reset obfuscator after TLS-handshake
-      stream.next_layer().set_obfuscator(nullptr);
-
-      // Clean
-      common::network::CleanSocket(socket);
-      common::network::CleanSsl(ssl);
-      // timeout
-      std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
       boost::beast::http::request<boost::beast::http::string_body> req{
           boost::beast::http::verb::post, handle, 11};
@@ -883,241 +599,306 @@ Response ApiClient::PostImpl(const std::string& handle,
       req.set(boost::beast::http::field::content_type, content_type);
       req.set(boost::beast::http::field::content_length,
           std::to_string(request.size()));
-
-      // set http headers
-      const auto headers = RealBrowserHeaders();
-      for (const auto& [key, value] : headers) {
+      for (const auto& [key, value] : RealBrowserHeaders()) {
         req.set(key, value);
       }
-
       req.body() = request;
       req.prepare_payload();
 
-      boost::beast::http::write(stream, req);
-
-      boost::beast::flat_buffer buffer;
-      boost::beast::http::response<boost::beast::http::dynamic_body> res;
-      boost::beast::http::read(stream, buffer, res);
-
-      respcode = static_cast<int>(res.result_int());
-      body = GetHttpBody(res);
-
-      boost::system::error_code ec;
-      stream.shutdown(ec);
-      try {
-        boost::beast::get_lowest_layer(stream).close();
-      } catch (boost::system::system_error const& e) {
-        SPDLOG_ERROR(
-            "POST [{}] - Exception during connection close for server {}: {}",
-            handle, ServerLogHost(), CleanErrorMessage(e.what()));
+      co_await boost::beast::http::async_write(conn.stream, req,
+          boost::asio::cancel_after(Remaining(deadline),
+              boost::asio::redirect_error(boost::asio::use_awaitable, ec)));
+      if (ec) {
+        error = CleanErrorMessage(ec.message());
+        respcode = 600;
+      } else {
+        boost::beast::flat_buffer buffer;
+        boost::beast::http::response<boost::beast::http::dynamic_body> res;
+        co_await boost::beast::http::async_read(conn.stream, buffer, res,
+            boost::asio::cancel_after(Remaining(deadline),
+                boost::asio::redirect_error(boost::asio::use_awaitable, ec)));
+        if (ec) {
+          error = CleanErrorMessage(ec.message());
+          respcode = 600;
+        } else {
+          respcode = static_cast<int>(res.result_int());
+          body = GetHttpBody(res);
+        }
       }
+
+      // Must not be the blocking shutdown(): it waits for the peer's
+      // close_notify, which parks a shared I/O thread when the peer never
+      // answers. Bounded and asynchronous so a slow peer costs nothing.
+      boost::system::error_code shutdown_ec;
+      co_await conn.stream.async_shutdown(
+          boost::asio::cancel_after(std::chrono::seconds(2),
+              boost::asio::redirect_error(
+                  boost::asio::use_awaitable, shutdown_ec)));
+    } else {
+      server_ip = conn.server_ip;
+    }
+
+    if (conn.ssl) {
+      utils::AttachCertificateVerificationCallbackDelete(conn.ssl);
     }
   } catch (const boost::system::system_error& err) {
-#ifdef _WIN32
-    error = CleanErrorMessage(boost::nowide::narrow(boost::nowide::widen(err.what())));
-#else
     error = CleanErrorMessage(err.what());
-#endif
     respcode = 600;
-    SPDLOG_ERROR("POST [{}] - System error for server {} (IP: {}): {}", handle,
+    SPDLOG_ERROR("{} - System error for server {} (IP: {}): {}", log_tag,
         ServerLogHost(), server_ip, error);
   } catch (const std::exception& e) {
-#ifdef _WIN32
-    error = CleanErrorMessage(boost::nowide::narrow(boost::nowide::widen(e.what())));
-#else
     error = CleanErrorMessage(e.what());
-#endif
     respcode = 601;
-    SPDLOG_ERROR("POST [{}] - Exception for server {} (IP: {}): {}", handle,
+    SPDLOG_ERROR("{} - Exception for server {} (IP: {}): {}", log_tag,
         ServerLogHost(), server_ip, error);
-  } catch (...) {
-    error = "Unknown exception";
-    respcode = 602;
-    SPDLOG_ERROR("POST [{}] - Unknown exception for server {} (IP: {})", handle,
-        ServerLogHost(), server_ip);
   }
-  if (ssl) {
-    utils::AttachCertificateVerificationCallbackDelete(ssl);
-  }
-  ClearCancellation();
 
-  const auto end_time = std::chrono::steady_clock::now();
   const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-      end_time - start_time);
-
+      std::chrono::steady_clock::now() - start_time);
   if (respcode >= 200 && respcode < 300) {
     SPDLOG_INFO(
-        "POST [{}] - Success from server {} (IP: {}) in {} ms - Status: {}, "
+        "{} - Success from server {} (IP: {}) in {} ms - Status: {}, "
         "Request: {} bytes, Response: {} bytes",
-        handle, ServerLogHost(), server_ip, duration.count(), respcode, request.size(),
-        body.size());
+        log_tag, ServerLogHost(), server_ip, duration.count(), respcode,
+        request.size(), body.size());
   } else {
     SPDLOG_WARN(
-        "POST [{}] - Failed from server {} (IP: {}) in {} ms - Status: {}, "
+        "{} - Failed from server {} (IP: {}) in {} ms - Status: {}, "
         "Error: {}, Request: {} bytes, Response: {} bytes",
-        handle, ServerLogHost(), server_ip, duration.count(), respcode, error,
+        log_tag, ServerLogHost(), server_ip, duration.count(), respcode, error,
         request.size(), body.size());
   }
-  return {body, respcode, error};
+  co_return Response{body, respcode, error};
 }
 
-bool ApiClient::TestHandshakeImpl(int timeout) const {
+boost::asio::awaitable<bool> ApiClient::AsyncTestHandshake(int timeout) const {
   const auto start_time = std::chrono::steady_clock::now();
+  const Deadline deadline = start_time + std::chrono::seconds(timeout);
+  const std::string log_tag = "TestHandshake";
+
+  std::string error;
+  int respcode = 400;
+  bool ok = false;
   std::string server_ip;
-  SSL* ssl = nullptr;
 
   try {
-    boost::asio::io_context ioc;
-    auto* ssl_ctx = utils::CreateNewSslCtx();
-    boost::asio::ssl::context ctx(ssl_ctx);
-
-    fptn::protocol::https::obfuscator::IObfuscatorSPtr obfuscator = nullptr;
+    obfuscator::IObfuscatorSPtr obfuscator = nullptr;
     if (censorship_strategy_ == CensorshipStrategy::kTlsObfuscator) {
-      obfuscator =
-          std::make_shared<fptn::protocol::https::obfuscator::TlsObfuscator2>();
+      obfuscator = std::make_shared<obfuscator::TlsObfuscator2>();
     }
+    Connection conn(co_await boost::asio::this_coro::executor,
+        utils::CreateNewSslCtx(), std::move(obfuscator));
 
-    tcp_stream_type tcp_stream(ioc);
-    obfuscator_socket_type obfuscator_stream(std::move(tcp_stream), obfuscator);
-    ssl_stream_type stream(std::move(obfuscator_stream), ctx);
+    ok = co_await EstablishAsync(conn, log_tag, deadline, error, respcode);
+    server_ip = conn.server_ip;
 
-    const std::string port_str = std::to_string(port_);
-    auto resolve_result = fptn::common::network::ResolveWithTimeout(
-        ioc, host_, port_str, timeout);
-
-    if (!resolve_result) {
-      SPDLOG_WARN("TestHandshake - DNS resolution failed for {}:{}: {}", host_,
-          port_, resolve_result.error.message());
-
-      const auto end_time = std::chrono::steady_clock::now();
-      const auto duration =
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              end_time - start_time);
-
-      SPDLOG_WARN(
-          "Handshake failed for server {} in {} ms - DNS resolution error",
-          host_, duration.count());
-      return false;
+    if (ok) {
+      // Must not be the blocking shutdown(): it waits for the peer's
+      // close_notify, which parks a shared I/O thread when the peer never
+      // answers. Bounded and asynchronous so a slow peer costs nothing.
+      boost::system::error_code shutdown_ec;
+      co_await conn.stream.async_shutdown(
+          boost::asio::cancel_after(std::chrono::seconds(2),
+              boost::asio::redirect_error(
+                  boost::asio::use_awaitable, shutdown_ec)));
     }
-
-    SPDLOG_INFO("TestHandshake - Connecting to server: {}:{} [strategy={}]",
-        host_, port_, ToString(censorship_strategy_));
-
-    boost::beast::get_lowest_layer(stream).expires_after(
-        std::chrono::seconds(timeout));
-    stream.next_layer().next_layer().expires_after(
-        std::chrono::seconds(timeout));
-
-    auto connected_endpoint =
-        boost::beast::get_lowest_layer(stream).connect(resolve_result.results);
-    server_ip = connected_endpoint.address().to_string();
-
-    SPDLOG_INFO("TestHandshake - Successfully connected to {} (IP: {})", host_,
-        server_ip);
-
-    auto& socket = boost::beast::get_lowest_layer(stream).socket();
-    SetSocketTimeouts(socket, timeout);
-
-    // Perform fake handshake if enabled
-    if (IsRealityModeWithFakeHandshake(censorship_strategy_)) {
-      SPDLOG_INFO("TestHandshake - Performing fake handshake");
-      if (!PerformFakeHandshake2(socket)) {
-        SPDLOG_WARN("TestHandshake - Fake handshake failed");
-        return false;
-      }
-      // For Reality Mode we use TLS obfuscator after fake handshake
-      stream.next_layer().set_obfuscator(
-          std::make_shared<protocol::https::obfuscator::TlsObfuscator2>());
+    if (conn.ssl) {
+      utils::AttachCertificateVerificationCallbackDelete(conn.ssl);
     }
-    utils::SetHandshakeSessionID(stream.native_handle());
-    utils::SetHandshakeSni(stream.native_handle(), sni_);
-
-    if (!expected_md5_fingerprint_.empty()) {
-      ssl = stream.native_handle();
-      std::string error;
-      utils::AttachCertificateVerificationCallback(
-          ssl, [this, &error](const std::string& md5_fingerprint) {
-            return onVerifyCertificate(md5_fingerprint, error);
-          });
-    } else {
-      ctx.set_verify_mode(boost::asio::ssl::verify_none);
-    }
-
-    // Perform TLS handshake
-    stream.handshake(boost::asio::ssl::stream_base::client);
-
-    // Reset obfuscator after TLS-handshake
-    if (IsRealityModeWithFakeHandshake(censorship_strategy_)) {
-      stream.next_layer().set_obfuscator(nullptr);
-    }
-
-    // Clean shutdown
-    boost::system::error_code ec;
-    stream.shutdown(ec);
-
-    // Close connection
-    boost::beast::get_lowest_layer(stream).close();
-
-    const auto end_time = std::chrono::steady_clock::now();
-    const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-        end_time - start_time);
-
-    SPDLOG_INFO("Handshake successful for server {} (IP: {}) in {} ms", host_,
-        server_ip, duration.count());
-
-    if (ssl) {
-      utils::AttachCertificateVerificationCallbackDelete(ssl);
-    }
-    return true;
-  } catch (const boost::system::system_error& err) {
-    std::string host_copy = host_;
-    std::string server_ip_copy = server_ip;
-    std::string error_msg;
-
-#ifdef _WIN32
-    error_msg = boost::nowide::narrow(boost::nowide::widen(err.what()));
-#else
-    error_msg = err.what();
-#endif
-
-    SPDLOG_WARN("Handshake failed for server {} (IP: {}): {}", host_copy,
-        server_ip_copy, error_msg);
   } catch (const std::exception& e) {
-    // Создаем копии строк перед использованием в логгере
-    std::string host_copy = host_;
-    std::string server_ip_copy = server_ip;
-    std::string error_msg;
-
-#ifdef _WIN32
-    error_msg = boost::nowide::narrow(boost::nowide::widen(e.what()));
-#else
-    error_msg = e.what();
-#endif
-
-    SPDLOG_WARN("Handshake failed for server {} (IP: {}): {}", host_copy,
-        server_ip_copy, error_msg);
-  } catch (...) {
-    // Создаем копии строк перед использованием в логгере
-    std::string host_copy = host_;
-    std::string server_ip_copy = server_ip;
-
-    SPDLOG_WARN("Handshake failed for server {} (IP: {}): Unknown exception",
-        host_copy, server_ip_copy);
+    error = CleanErrorMessage(e.what());
+    SPDLOG_WARN("Handshake failed for server {} (IP: {}): {}", ServerLogHost(),
+        server_ip, error);
+    ok = false;
   }
 
-  if (ssl) {
-    utils::AttachCertificateVerificationCallbackDelete(ssl);
-  }
-
-  const auto end_time = std::chrono::steady_clock::now();
   const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-      end_time - start_time);
-
-  SPDLOG_WARN("Handshake failed for server {} (IP: {}) in {} ms", host_,
-      server_ip, duration.count());
-
-  return false;
+      std::chrono::steady_clock::now() - start_time);
+  if (ok) {
+    SPDLOG_INFO("Handshake successful for server {} (IP: {}) in {} ms",
+        ServerLogHost(), server_ip, duration.count());
+  } else {
+    SPDLOG_WARN("Handshake failed for server {} (IP: {}) in {} ms - {}",
+        ServerLogHost(), server_ip, duration.count(), error);
+  }
+  co_return ok;
 }
+
+void ApiClient::BeginOperation(
+    const boost::asio::strand<boost::asio::io_context::executor_type>& strand,
+    const std::shared_ptr<boost::asio::cancellation_signal>& signal) const {
+  const std::scoped_lock lock(cancellation_->mutex);
+  cancellation_->strand = strand;
+  cancellation_->signal = signal;
+}
+
+void ApiClient::EndOperation() const {
+  const std::scoped_lock lock(cancellation_->mutex);
+  cancellation_->strand.reset();
+  cancellation_->signal.reset();
+}
+
+void ApiClient::Cancel() const {
+  std::shared_ptr<boost::asio::cancellation_signal> signal;
+  std::optional<boost::asio::strand<boost::asio::io_context::executor_type>>
+      strand;
+  {
+    const std::scoped_lock lock(cancellation_->mutex);
+    signal = cancellation_->signal;
+    strand = cancellation_->strand;
+  }
+  if (!signal || !strand) {
+    return;
+  }
+  // Emitted on the operation's own strand, so it is serialised with that
+  // operation's I/O instead of racing it from another thread.
+  boost::asio::post(*strand, [signal] {
+    signal->emit(boost::asio::cancellation_type::terminal);
+  });
+}
+
+// --- Blocking adapters -------------------------------------------------
+// Kept for fptn-client and fptn-server, which are synchronous. They spawn the
+// coroutine on the shared runtime and wait; no per-request thread is created.
+
+Response ApiClient::Get(const std::string& handle, int timeout) const {
+  auto strand = boost::asio::make_strand(IoRuntime::Instance().Context());
+  auto signal = std::make_shared<boost::asio::cancellation_signal>();
+  BeginOperation(strand, signal);
+
+  auto future = boost::asio::co_spawn(strand, AsyncGet(handle, timeout),
+      boost::asio::bind_cancellation_slot(
+          signal->slot(), boost::asio::use_future));
+  Response response;
+  try {
+    response = future.get();
+  } catch (const std::exception& e) {
+    response = Response{"", 601, CleanErrorMessage(e.what())};
+  }
+  EndOperation();
+  return response;
+}
+
+Response ApiClient::Post(const std::string& handle,
+    const std::string& request,
+    const std::string& content_type,
+    int timeout) const {
+  auto strand = boost::asio::make_strand(IoRuntime::Instance().Context());
+  auto signal = std::make_shared<boost::asio::cancellation_signal>();
+  BeginOperation(strand, signal);
+
+  auto future = boost::asio::co_spawn(strand,
+      AsyncPost(handle, request, content_type, timeout),
+      boost::asio::bind_cancellation_slot(
+          signal->slot(), boost::asio::use_future));
+  Response response;
+  try {
+    response = future.get();
+  } catch (const std::exception& e) {
+    response = Response{"", 601, CleanErrorMessage(e.what())};
+  }
+  EndOperation();
+  return response;
+}
+
+bool ApiClient::TestHandshake(int timeout) const {
+  auto strand = boost::asio::make_strand(IoRuntime::Instance().Context());
+  auto signal = std::make_shared<boost::asio::cancellation_signal>();
+  BeginOperation(strand, signal);
+
+  auto future = boost::asio::co_spawn(strand, AsyncTestHandshake(timeout),
+      boost::asio::bind_cancellation_slot(
+          signal->slot(), boost::asio::use_future));
+  bool result = false;
+  try {
+    result = future.get();
+  } catch (const std::exception& e) {
+    SPDLOG_WARN("TestHandshake - failed for {}: {}", ServerLogHost(), e.what());
+  }
+  EndOperation();
+  return result;
+}
+
+// --- Fire-and-forget adapters ------------------------------------------
+// The coroutine is wrapped in a lambda that owns a *copy* of this client, so
+// asio keeps it alive for the whole operation. Spawning `AsyncPost(...)`
+// directly would bind the coroutine to `this`, which the caller is free to
+// destroy the moment these functions return.
+
+void ApiClient::SpawnGet(const std::string& handle,
+    int timeout,
+    std::function<void(Response)> completion) const {
+  auto strand = boost::asio::make_strand(IoRuntime::Instance().Context());
+  auto signal = std::make_shared<boost::asio::cancellation_signal>();
+  BeginOperation(strand, signal);
+
+  boost::asio::co_spawn(strand,
+      [self = *this, handle, timeout]() -> boost::asio::awaitable<Response> {
+        co_return co_await self.AsyncGet(handle, timeout);
+      },
+      boost::asio::bind_cancellation_slot(signal->slot(),
+          [self = *this, completion = std::move(completion)](
+              std::exception_ptr eptr, Response response) {
+            self.EndOperation();
+            if (eptr) {
+              completion(Response{"", 601, "operation failed"});
+              return;
+            }
+            completion(std::move(response));
+          }));
+}
+
+void ApiClient::SpawnPost(const std::string& handle,
+    const std::string& request,
+    const std::string& content_type,
+    int timeout,
+    std::function<void(Response)> completion) const {
+  auto strand = boost::asio::make_strand(IoRuntime::Instance().Context());
+  auto signal = std::make_shared<boost::asio::cancellation_signal>();
+  BeginOperation(strand, signal);
+
+  boost::asio::co_spawn(strand,
+      [self = *this, handle, request, content_type,
+          timeout]() -> boost::asio::awaitable<Response> {
+        co_return co_await self.AsyncPost(
+            handle, request, content_type, timeout);
+      },
+      boost::asio::bind_cancellation_slot(signal->slot(),
+          [self = *this, completion = std::move(completion)](
+              std::exception_ptr eptr, Response response) {
+            self.EndOperation();
+            if (eptr) {
+              completion(Response{"", 601, "operation failed"});
+              return;
+            }
+            completion(std::move(response));
+          }));
+}
+
+void ApiClient::SpawnTestHandshake(
+    int timeout, std::function<void(bool)> completion) const {
+  auto strand = boost::asio::make_strand(IoRuntime::Instance().Context());
+  auto signal = std::make_shared<boost::asio::cancellation_signal>();
+  BeginOperation(strand, signal);
+
+  boost::asio::co_spawn(strand,
+      [self = *this, timeout]() -> boost::asio::awaitable<bool> {
+        co_return co_await self.AsyncTestHandshake(timeout);
+      },
+      boost::asio::bind_cancellation_slot(signal->slot(),
+          [self = *this, completion = std::move(completion)](
+              std::exception_ptr eptr, bool ok) {
+            self.EndOperation();
+            completion(eptr ? false : ok);
+          }));
+}
+
+ApiClient ApiClient::Clone() const {
+  ApiClient temp_client(
+      host_, port_, sni_, expected_md5_fingerprint_, censorship_strategy_);
+  return temp_client;
+}
+
 
 bool ApiClient::onVerifyCertificate(
     const std::string& md5_fingerprint, std::string& error) const {
