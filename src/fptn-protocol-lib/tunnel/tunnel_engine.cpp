@@ -10,6 +10,10 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 #include "fptn-protocol-lib/tunnel/l3_tunnel_data_plane.h"
 
+#ifdef FPTN_HAS_LWIP
+#include "fptn-protocol-lib/tunnel/flow_proxy_data_plane.h"
+#endif
+
 namespace fptn::tunnel {
 
 TunnelEngine::TunnelEngine(
@@ -31,8 +35,19 @@ std::expected<std::unique_ptr<TunnelEngine>, TunnelError> TunnelEngine::Create(
       return std::unique_ptr<TunnelEngine>(
           new TunnelEngine(mode, std::move(data_plane)));
     }
-    case DataPlaneMode::flow_proxy:
+    case DataPlaneMode::flow_proxy: {
+#ifdef FPTN_HAS_LWIP
+      if (config.l3.tun_ipv4.empty()) {
+        return std::unexpected(TunnelError::invalid_configuration);
+      }
+      auto data_plane = std::make_unique<FlowProxyDataPlane>(
+          std::move(config), std::move(callbacks));
+      return std::unique_ptr<TunnelEngine>(
+          new TunnelEngine(mode, std::move(data_plane)));
+#else
       break;
+#endif
+    }
   }
   return std::unexpected(TunnelError::unsupported_mode);
 }

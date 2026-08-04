@@ -145,7 +145,13 @@ if (FPTN_WITH_LWIP)
       flow/lwip_stack.h
       flow/lwip_stack.cpp
       flow/lwip_tcp.cpp
-      flow/pbuf_buffer_sequence.h)
+      flow/direct_tcp_outbound.h
+      flow/direct_tcp_outbound.cpp
+      flow/pbuf_buffer_sequence.h
+      tunnel/tunnel_runtime.h
+      tunnel/tunnel_runtime.cpp
+      tunnel/flow_proxy_data_plane.h
+      tunnel/flow_proxy_data_plane.cpp)
 endif()
 
 # PR1A: iOS socket buffer experiment parameter.

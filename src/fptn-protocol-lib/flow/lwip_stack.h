@@ -99,7 +99,7 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink {
       FlowId flow, IpEndpoint source, BufferView payload) noexcept override;
 
   void OnOutboundConnected(FlowId flow) override;
-  bool OnOutboundData(FlowId flow, OwnedBuffer data) override;
+  bool OnOutboundData(FlowId flow, OwnedBuffer& data) override;
   void OnOutboundFinished(FlowId flow) override;
   void OnOutboundReset(FlowId flow, FlowError error) override;
   void OnOutboundWritable(FlowId flow) override;

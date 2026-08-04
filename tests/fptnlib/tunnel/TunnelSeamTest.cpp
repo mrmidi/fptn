@@ -116,14 +116,19 @@ TEST(TunnelEngineTest, CreateRejectsInvalidL3Configuration) {
   EXPECT_EQ(result.error(), TunnelError::invalid_configuration);
 }
 
-TEST(TunnelEngineTest, CreateRejectsFlowProxyBeforeLwipLands) {
+TEST(TunnelEngineTest, CreateFlowProxyDependsOnLwipBuild) {
   TunnelCallbacks callbacks;
   auto config = MakeL3Configuration();
   config.mode = DataPlaneMode::flow_proxy;
 
   auto result = TunnelEngine::Create(config, callbacks);
+#ifdef FPTN_HAS_LWIP
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ((*result)->mode(), DataPlaneMode::flow_proxy);
+#else
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error(), TunnelError::unsupported_mode);
+#endif
 
   config.mode = static_cast<DataPlaneMode>(99);
   result = TunnelEngine::Create(config, callbacks);

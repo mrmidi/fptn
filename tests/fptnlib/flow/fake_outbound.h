@@ -23,7 +23,6 @@ class FakeTcpOutbound final : public ITcpOutbound {
       sink.OnOutboundConnected(metadata.id);
     }
   }
-
   OutboundAdmission Write(FlowId flow, BufferSequence data) override {
     if (reject_writes_) {
       return OutboundAdmission::queue_full;

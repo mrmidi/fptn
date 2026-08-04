@@ -56,4 +56,9 @@ if (FPTN_WITH_LWIP)
   add_executable(LwipTcpTest flow/LwipTcpTest.cpp)
   target_link_libraries(LwipTcpTest PRIVATE ${LIBS})
   add_test(NAME LwipTcpTest COMMAND LwipTcpTest)
+
+  # PR-LW4: DIRECT TCP outbound through the tunnel engine.
+  add_executable(DirectTcpFlowTest flow/DirectTcpFlowTest.cpp)
+  target_link_libraries(DirectTcpFlowTest PRIVATE ${LIBS})
+  add_test(NAME DirectTcpFlowTest COMMAND DirectTcpFlowTest)
 endif()

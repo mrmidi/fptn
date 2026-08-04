@@ -174,7 +174,8 @@ TEST_F(LwipTcpTest, OutboundDataReachesApp) {
   const std::string payload = "world";
   const FlowId flow = OpenedFlow();
   OwnedBuffer data(payload.begin(), payload.end());
-  EXPECT_TRUE(OutboundSink()->OnOutboundData(flow, std::move(data)));
+  EXPECT_TRUE(OutboundSink()->OnOutboundData(flow, data));
+  EXPECT_TRUE(data.empty());
 
   ASSERT_TRUE(collector_.WaitFor(2,
       [&payload](const std::vector<OwnedPacket>& packets) {

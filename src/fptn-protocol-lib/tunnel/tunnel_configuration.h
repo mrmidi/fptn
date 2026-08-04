@@ -13,6 +13,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 #include "fptn-protocol-lib/https/censorship_strategy.h"
 #include "fptn-protocol-lib/tunnel/data_plane_mode.h"
+#include "fptn-protocol-lib/tunnel/flow_types.h"
 
 namespace fptn::tunnel {
 
@@ -33,11 +34,13 @@ struct TunnelL3Configuration {
 struct TunnelCallbacks {
   using PacketBatchCallback =
       std::function<void(fptn::common::network::BatchIPPacketPtr)>;
+  using OwnedPacketBatchCallback = std::function<void(OwnedPacketBatch)>;
   using ConnectedCallback = std::function<void()>;
   using DisconnectedCallback =
       std::function<void(bool was_connected, const std::string& reason)>;
 
   PacketBatchCallback on_packet_batch;
+  OwnedPacketBatchCallback on_owned_packet_batch;
   ConnectedCallback on_connected;
   DisconnectedCallback on_disconnected;
 };

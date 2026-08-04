@@ -55,7 +55,9 @@ class ITcpOutboundSink {
   virtual ~ITcpOutboundSink() = default;
 
   virtual void OnOutboundConnected(FlowId flow) = 0;
-  virtual bool OnOutboundData(FlowId flow, OwnedBuffer data) = 0;
+  // Consumes `data` only when returning true; on false the outbound must
+  // retain the bytes and retry after StackWindowOpen().
+  virtual bool OnOutboundData(FlowId flow, OwnedBuffer& data) = 0;
   virtual void OnOutboundFinished(FlowId flow) = 0;
   virtual void OnOutboundReset(FlowId flow, FlowError error) = 0;
   virtual void OnOutboundWritable(FlowId flow) = 0;

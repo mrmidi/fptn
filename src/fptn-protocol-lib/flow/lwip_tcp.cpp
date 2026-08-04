@@ -322,10 +322,17 @@ void LwipStack::ResetTcp(FlowId flow_id) noexcept {
 
 void LwipStack::OnOutboundConnected(FlowId) {}
 
-bool LwipStack::OnOutboundData(FlowId flow_id, OwnedBuffer data) {
+bool LwipStack::OnOutboundData(FlowId flow_id, OwnedBuffer& data) {
+  if (data.empty()) {
+    return true;
+  }
   const BufferView view{data.data(), data.size()};
   const BufferSequence sequence{&view, 1};
-  return WriteTcp(flow_id, sequence) == WriteResult::accepted;
+  if (WriteTcp(flow_id, sequence) != WriteResult::accepted) {
+    return false;
+  }
+  data.clear();
+  return true;
 }
 
 void LwipStack::OnOutboundFinished(FlowId flow_id) {
