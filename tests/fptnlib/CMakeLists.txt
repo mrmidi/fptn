@@ -40,3 +40,8 @@ add_test(NAME ApiClientTest COMMAND ApiClientTest)
 add_executable(PacketSerializerTest protocol/PacketSerializerTest.cpp)
 target_link_libraries(PacketSerializerTest PRIVATE ${LIBS})
 add_test(NAME PacketSerializerTest COMMAND PacketSerializerTest)
+
+# PR-LW0: tunnel engine seam (DataPlaneMode/IDataPlane/TunnelEngine).
+add_executable(TunnelSeamTest tunnel/TunnelSeamTest.cpp)
+target_link_libraries(TunnelSeamTest PRIVATE ${LIBS})
+add_test(NAME TunnelSeamTest COMMAND TunnelSeamTest)

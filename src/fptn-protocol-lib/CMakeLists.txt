@@ -124,6 +124,17 @@ set(FPTN_CLIENT_PROTOCOL_SOURCES
     protocol/yaff/yaff_serializer.cpp
     time/time_provider.h
     time/time_provider.cpp
+    tunnel/data_plane_mode.h
+    tunnel/flow_interfaces.h
+    tunnel/flow_types.h
+    tunnel/i_data_plane.h
+    tunnel/l3_tunnel_data_plane.h
+    tunnel/l3_tunnel_data_plane.cpp
+    tunnel/packet_types.h
+    tunnel/tunnel_configuration.h
+    tunnel/tunnel_engine.h
+    tunnel/tunnel_engine.cpp
+    tunnel/tunnel_error.h
     https/obfuscator/methods/detector.h)
 
 add_library("${PROJECT_NAME}_static" STATIC ${FPTN_CLIENT_PROTOCOL_SOURCES})
