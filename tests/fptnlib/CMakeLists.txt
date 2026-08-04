@@ -45,3 +45,15 @@ add_test(NAME PacketSerializerTest COMMAND PacketSerializerTest)
 add_executable(TunnelSeamTest tunnel/TunnelSeamTest.cpp)
 target_link_libraries(TunnelSeamTest PRIVATE ${LIBS})
 add_test(NAME TunnelSeamTest COMMAND TunnelSeamTest)
+
+# PR-LW2: lwIP netif + packet pump.
+if (FPTN_WITH_LWIP)
+  add_executable(LwipStackTest flow/LwipStackTest.cpp)
+  target_link_libraries(LwipStackTest PRIVATE ${LIBS})
+  add_test(NAME LwipStackTest COMMAND LwipStackTest)
+
+  # PR-LW3: transparent TCP frontend.
+  add_executable(LwipTcpTest flow/LwipTcpTest.cpp)
+  target_link_libraries(LwipTcpTest PRIVATE ${LIBS})
+  add_test(NAME LwipTcpTest COMMAND LwipTcpTest)
+endif()

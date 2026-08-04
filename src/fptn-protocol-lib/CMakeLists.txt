@@ -139,6 +139,15 @@ set(FPTN_CLIENT_PROTOCOL_SOURCES
 
 add_library("${PROJECT_NAME}_static" STATIC ${FPTN_CLIENT_PROTOCOL_SOURCES})
 
+# PR-LW2: lwIP flow-proxy stack (optional capability).
+if (FPTN_WITH_LWIP)
+  target_sources("${PROJECT_NAME}_static" PRIVATE
+      flow/lwip_stack.h
+      flow/lwip_stack.cpp
+      flow/lwip_tcp.cpp
+      flow/pbuf_buffer_sequence.h)
+endif()
+
 # PR1A: iOS socket buffer experiment parameter.
 # 0 = kernel default. Test variants:
 #   cmake -DFPTN_IOS_SOCKET_BUFFER_BYTES=262144  (256 KiB)
@@ -206,5 +215,12 @@ foreach(target "${PROJECT_NAME}_static")
 
   if (FPTN_WITH_MIMALLOC)
     target_link_libraries(${target} mimalloc-static)
+  endif()
+
+  # PR-LW1: absorb the lwIP objects into this archive and advertise the
+  # capability to consumers (Conan mirrors the define via cpp_info).
+  if (FPTN_WITH_LWIP)
+    target_link_libraries(${target} fptn_lwip)
+    target_compile_definitions(${target} PUBLIC FPTN_HAS_LWIP=1)
   endif()
 endforeach()

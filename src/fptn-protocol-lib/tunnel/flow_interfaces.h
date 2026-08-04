@@ -44,4 +44,32 @@ class IFlowRouter {
   virtual RouteAction Match(const FlowMetadata& metadata) = 0;
 };
 
+enum class OutboundAdmission : std::uint8_t {
+  accepted = 0,
+  queue_full = 1,
+  flow_closed = 2,
+};
+
+class ITcpOutboundSink {
+ public:
+  virtual ~ITcpOutboundSink() = default;
+
+  virtual void OnOutboundConnected(FlowId flow) = 0;
+  virtual bool OnOutboundData(FlowId flow, OwnedBuffer data) = 0;
+  virtual void OnOutboundFinished(FlowId flow) = 0;
+  virtual void OnOutboundReset(FlowId flow, FlowError error) = 0;
+  virtual void OnOutboundWritable(FlowId flow) = 0;
+};
+
+class ITcpOutbound {
+ public:
+  virtual ~ITcpOutbound() = default;
+
+  virtual void Open(FlowMetadata metadata, ITcpOutboundSink& sink) = 0;
+  virtual OutboundAdmission Write(FlowId flow, BufferSequence data) = 0;
+  virtual void Finish(FlowId flow) = 0;
+  virtual void Reset(FlowId flow) = 0;
+  virtual void StackWindowOpen(FlowId flow) = 0;
+};
+
 }  // namespace fptn::tunnel

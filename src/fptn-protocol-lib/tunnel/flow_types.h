@@ -8,6 +8,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <vector>
 
@@ -64,5 +65,13 @@ struct BufferView {
 
 using BufferSequence = std::span<const BufferView>;
 using OwnedBuffer = std::vector<std::uint8_t>;
+
+struct OwnedPacket {
+  OwnedBuffer data;
+  std::uint8_t ip_version = 0;
+};
+
+using OwnedPacketBatch = std::vector<OwnedPacket>;
+using PacketOutputCallback = std::function<void(OwnedPacketBatch)>;
 
 }  // namespace fptn::tunnel
