@@ -145,8 +145,11 @@ if (FPTN_WITH_LWIP)
       flow/lwip_stack.h
       flow/lwip_stack.cpp
       flow/lwip_tcp.cpp
+      flow/lwip_udp.cpp
       flow/direct_tcp_outbound.h
       flow/direct_tcp_outbound.cpp
+      flow/direct_udp_outbound.h
+      flow/direct_udp_outbound.cpp
       flow/pbuf_buffer_sequence.h
       tunnel/tunnel_runtime.h
       tunnel/tunnel_runtime.cpp

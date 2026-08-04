@@ -107,8 +107,7 @@ inline std::vector<std::uint8_t> MakeTcpV4(const char* src, const char* dst,
 inline std::vector<std::uint8_t> MakeTcpV6(const char* src, const char* dst,
     std::uint16_t sport, std::uint16_t dport, std::uint32_t seq,
     std::uint32_t ack, std::uint8_t flags,
-    const std::vector<std::uint8_t>& payload = {}) {
-  const std::size_t tcp_length = 20 + payload.size();
+    const std::vector<std::uint8_t>& payload = {}) {  const std::size_t tcp_length = 20 + payload.size();
   const std::size_t total = 40 + tcp_length;
   std::vector<std::uint8_t> packet(total, 0);
 
@@ -241,6 +240,71 @@ inline std::uint32_t ReadAck(const std::vector<std::uint8_t>& data,
 inline std::uint8_t ReadFlags(const std::vector<std::uint8_t>& data,
     std::size_t tcp_offset) {
   return data[tcp_offset + 13];
+}
+
+inline std::vector<std::uint8_t> MakeUdpV4(const char* src, const char* dst,
+    std::uint16_t sport, std::uint16_t dport,
+    const std::vector<std::uint8_t>& payload) {
+  const std::size_t udp_length = 8 + payload.size();
+  const std::size_t total = 20 + udp_length;
+  std::vector<std::uint8_t> packet(total, 0);
+
+  packet[0] = 0x45;
+  WriteU16(packet, 2, static_cast<std::uint16_t>(total));
+  packet[8] = 64;
+  packet[9] = 17;
+  const std::uint32_t src_addr = ParseV4(src);
+  const std::uint32_t dst_addr = ParseV4(dst);
+  std::memcpy(packet.data() + 12, &src_addr, 4);
+  std::memcpy(packet.data() + 16, &dst_addr, 4);
+  WriteU16(packet, 10, Checksum(packet.data(), 20));
+
+  std::uint8_t* udp = packet.data() + 20;
+  WriteU16(packet, 20, sport);
+  WriteU16(packet, 22, dport);
+  WriteU16(packet, 24, static_cast<std::uint16_t>(udp_length));
+  if (!payload.empty()) {
+    std::memcpy(packet.data() + 28, payload.data(), payload.size());
+  }
+
+  std::uint32_t pseudo = Sum16Folded(packet.data() + 12, 8);
+  pseudo += 17;
+  pseudo += static_cast<std::uint32_t>(udp_length);
+  WriteU16(packet, 26, Checksum(udp, udp_length, pseudo));
+  return packet;
+}
+
+inline std::vector<std::uint8_t> MakeUdpV6(const char* src, const char* dst,
+    std::uint16_t sport, std::uint16_t dport,
+    const std::vector<std::uint8_t>& payload) {
+  const std::size_t udp_length = 8 + payload.size();
+  const std::size_t total = 40 + udp_length;
+  std::vector<std::uint8_t> packet(total, 0);
+
+  packet[0] = 0x60;
+  WriteU16(packet, 4, static_cast<std::uint16_t>(udp_length));
+  packet[6] = 17;
+  packet[7] = 64;
+  in6_addr src6;
+  in6_addr dst6;
+  EXPECT_EQ(1, inet_pton(AF_INET6, src, &src6));
+  EXPECT_EQ(1, inet_pton(AF_INET6, dst, &dst6));
+  std::memcpy(packet.data() + 8, &src6, 16);
+  std::memcpy(packet.data() + 24, &dst6, 16);
+
+  std::uint8_t* udp = packet.data() + 40;
+  WriteU16(packet, 40, sport);
+  WriteU16(packet, 42, dport);
+  WriteU16(packet, 44, static_cast<std::uint16_t>(udp_length));
+  if (!payload.empty()) {
+    std::memcpy(packet.data() + 48, payload.data(), payload.size());
+  }
+
+  std::uint32_t pseudo = Sum16Folded(packet.data() + 8, 32);
+  pseudo += static_cast<std::uint32_t>(udp_length);
+  pseudo += 17;
+  WriteU16(packet, 46, Checksum(udp, udp_length, pseudo));
+  return packet;
 }
 
 }  // namespace fptn::tunnel::flow::testing

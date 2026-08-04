@@ -7,18 +7,21 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <expected>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/steady_timer.hpp>
 
 #include <lwip/netif.h>
 #include <lwip/tcp.h>
+#include <lwip/udp.h>
 
 #include "fptn-protocol-lib/tunnel/flow_interfaces.h"
 #include "fptn-protocol-lib/tunnel/flow_types.h"
@@ -32,6 +35,8 @@ struct StackConfiguration {
   std::string tun_ipv6 = "fd00::1";
   std::uint16_t mtu = 1400;
   std::uint64_t max_ingress_inflight_bytes = 2 * 1024 * 1024;
+  std::uint64_t max_udp_associations = 32;
+  std::chrono::milliseconds udp_idle_timeout{30000};
 };
 
 struct StackCounters {
@@ -71,13 +76,23 @@ struct LwipTcpFlow {
   bool closing = false;
 };
 
-class LwipStack final : public INetworkStack, public ITcpOutboundSink {
+struct LwipUdpFlow {
+  LwipStack* stack = nullptr;
+  FlowId id = 0;
+  struct udp_pcb* pcb = nullptr;
+  FlowMetadata metadata;
+  std::chrono::steady_clock::time_point last_activity;
+};
+
+class LwipStack final : public INetworkStack, public ITcpOutboundSink,
+                        public IUdpOutboundSink {
  public:
   LwipStack(boost::asio::any_io_executor executor,
       StackConfiguration config,
       IFlowEventSink& sink,
       IFlowRouter& router,
       ITcpOutbound& tcp_outbound,
+      IUdpOutbound& udp_outbound,
       PacketOutputCallback output);
   ~LwipStack() override;
 
@@ -103,6 +118,9 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink {
   void OnOutboundFinished(FlowId flow) override;
   void OnOutboundReset(FlowId flow, FlowError error) override;
   void OnOutboundWritable(FlowId flow) override;
+
+  void OnUdpDatagramReceived(FlowId flow, OwnedBuffer payload) override;
+  void OnUdpReset(FlowId flow, FlowError error) override;
 
   const StackCounters& counters() const noexcept { return counters_; }
   const StackConfiguration& configuration() const noexcept { return config_; }
@@ -136,11 +154,26 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink {
   static err_t OnTcpSent(void* arg, struct tcp_pcb* tpcb, u16_t len);
   static void OnTcpError(void* arg, err_t err);
 
+  err_t StartUdpListener();
+  void StopUdpFlows() noexcept;
+  LwipUdpFlow* FindUdpFlow(FlowId flow) noexcept;
+  void DestroyUdpFlow(FlowId flow) noexcept;
+  void ScheduleUdpExpirySweep();
+  void UdpExpirySweep(const boost::system::error_code& ec);
+
+  static void OnUdpAccept(void* arg, struct udp_pcb* pcb, struct pbuf* p,
+      const ip_addr_t* addr, u16_t port);
+  static void OnUdpFlowRecv(void* arg, struct udp_pcb* pcb, struct pbuf* p,
+      const ip_addr_t* addr, u16_t port);
+  static void OnUdpDropRecv(void* arg, struct udp_pcb* pcb, struct pbuf* p,
+      const ip_addr_t* addr, u16_t port);
+
   boost::asio::any_io_executor executor_;
   StackConfiguration config_;
   IFlowEventSink& sink_;
   IFlowRouter& router_;
   ITcpOutbound& tcp_outbound_;
+  IUdpOutbound& udp_outbound_;
   PacketOutputCallback output_;
   StackCounters counters_;
 
@@ -154,6 +187,15 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink {
   FlowId next_flow_id_{1};
   struct tcp_pcb* listener_{nullptr};
   std::unordered_map<FlowId, std::unique_ptr<LwipTcpFlow>> tcp_flows_;
+
+  struct udp_pcb* udp_listener_{nullptr};
+  std::unordered_map<FlowId, std::unique_ptr<LwipUdpFlow>> udp_flows_;
+  // PCBs for tuples rejected at the association cap. They must stay in the
+  // lwIP pcb list (matching their tuple) so the fork's accept loop does not
+  // recreate them for every datagram; one is released whenever a slot frees.
+  std::vector<struct udp_pcb*> rejected_udp_pcbs_;
+  boost::asio::steady_timer udp_expiry_timer_;
+  bool udp_expiry_scheduled_{false};
 };
 
 }  // namespace fptn::tunnel::flow

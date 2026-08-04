@@ -33,6 +33,7 @@ std::expected<void, TunnelError> FlowProxyDataPlane::Start() {
   router_ = std::make_unique<DirectRouter>();
   event_sink_ = std::make_unique<NullEventSink>();
   tcp_outbound_ = std::make_unique<flow::DirectTcpOutbound>(executor);
+  udp_outbound_ = std::make_unique<flow::DirectUdpOutbound>(executor);
 
   flow::StackConfiguration stack_config;
   stack_config.tun_ipv4 = config_.l3.tun_ipv4;
@@ -41,6 +42,7 @@ std::expected<void, TunnelError> FlowProxyDataPlane::Start() {
   auto output = callbacks_.on_owned_packet_batch;
   stack_ = std::make_unique<flow::LwipStack>(executor,
       std::move(stack_config), *event_sink_, *router_, *tcp_outbound_,
+      *udp_outbound_,
       [output](OwnedPacketBatch batch) {
         if (output) {
           output(std::move(batch));
@@ -50,7 +52,8 @@ std::expected<void, TunnelError> FlowProxyDataPlane::Start() {
   auto result = stack_->Start();
   if (!result.has_value()) {
     tcp_outbound_.reset();
-  stack_.reset();
+    udp_outbound_.reset();
+    stack_.reset();
     router_.reset();
     event_sink_.reset();
     runtime_.Stop();
@@ -76,6 +79,9 @@ void FlowProxyDataPlane::Stop() noexcept {
       if (tcp_outbound_) {
         tcp_outbound_->Stop();
       }
+      if (udp_outbound_) {
+        udp_outbound_->Stop();
+      }
       done.set_value();
     });
     future.get();
@@ -84,6 +90,7 @@ void FlowProxyDataPlane::Stop() noexcept {
 
   stack_.reset();
   tcp_outbound_.reset();
+  udp_outbound_.reset();
   router_.reset();
   event_sink_.reset();
   runtime_.Stop();

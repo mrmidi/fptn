@@ -74,6 +74,46 @@ class FakeTcpOutbound final : public ITcpOutbound {
   bool auto_admit_open_ = false;
 };
 
+class FakeUdpOutbound final : public IUdpOutbound {
+ public:
+  void Open(FlowMetadata metadata, IUdpOutboundSink& sink) override {
+    opened_.push_back(metadata);
+    last_sink_ = &sink;
+  }
+
+  OutboundAdmission Send(FlowId flow, BufferView payload) override {
+    if (reject_sends_) {
+      return OutboundAdmission::queue_full;
+    }
+    sent_.push_back(
+        SentDatagram{flow,
+            std::vector<std::uint8_t>(payload.data,
+                payload.data + payload.size)});
+    return OutboundAdmission::accepted;
+  }
+
+  void Reset(FlowId flow) override { reset_.push_back(flow); }
+
+  void SetRejectSends(bool reject) { reject_sends_ = reject; }
+
+  const std::vector<FlowMetadata>& Opened() const { return opened_; }
+  const std::vector<FlowId>& Reset() const { return reset_; }
+  IUdpOutboundSink* LastSink() const { return last_sink_; }
+
+  struct SentDatagram {
+    FlowId flow;
+    std::vector<std::uint8_t> bytes;
+  };
+  const std::vector<SentDatagram>& Sent() const { return sent_; }
+
+ private:
+  std::vector<FlowMetadata> opened_;
+  std::vector<SentDatagram> sent_;
+  std::vector<FlowId> reset_;
+  IUdpOutboundSink* last_sink_ = nullptr;
+  bool reject_sends_ = false;
+};
+
 class RecordingSink final : public IFlowEventSink {
  public:
   void OnTcpOpen(FlowMetadata metadata) override {
@@ -82,12 +122,23 @@ class RecordingSink final : public IFlowEventSink {
   void OnTcpData(FlowId, OwnedBuffer) override {}
   void OnTcpHalfClose(FlowId) override {}
   void OnTcpReset(FlowId, FlowError) override {}
-  void OnUdpDatagram(FlowMetadata, OwnedBuffer) override {}
+  void OnUdpDatagram(FlowMetadata metadata, OwnedBuffer payload) override {
+    udp_datagrams_.push_back(UdpDatagram{metadata, std::move(payload)});
+  }
 
   const std::vector<FlowMetadata>& Opened() const { return opened_; }
 
+  struct UdpDatagram {
+    FlowMetadata metadata;
+    OwnedBuffer payload;
+  };
+  const std::vector<UdpDatagram>& UdpDatagrams() const {
+    return udp_datagrams_;
+  }
+
  private:
   std::vector<FlowMetadata> opened_;
+  std::vector<UdpDatagram> udp_datagrams_;
 };
 
 }  // namespace fptn::tunnel::flow::testing

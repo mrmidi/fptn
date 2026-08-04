@@ -45,14 +45,17 @@ LwipStack::LwipStack(boost::asio::any_io_executor executor,
     IFlowEventSink& sink,
     IFlowRouter& router,
     ITcpOutbound& tcp_outbound,
+    IUdpOutbound& udp_outbound,
     PacketOutputCallback output)
     : executor_(std::move(executor)),
       config_(std::move(config)),
       sink_(sink),
       router_(router),
       tcp_outbound_(tcp_outbound),
+      udp_outbound_(udp_outbound),
       output_(std::move(output)),
-      timeout_timer_(executor_) {}
+      timeout_timer_(executor_),
+      udp_expiry_timer_(executor_) {}
 
 LwipStack::~LwipStack() {
   if (IsRunning()) {
@@ -139,7 +142,20 @@ std::expected<void, TunnelError> LwipStack::StartOnExecutor() {
     return listener_result;
   }
 
+  if (StartUdpListener() != ERR_OK) {
+    tcp_arg(listener_, nullptr);
+    tcp_close(listener_);
+    listener_ = nullptr;
+    netif_set_down(&netif_);
+    netif_remove(&netif_);
+    netif_added_ = false;
+    std::memset(&netif_, 0, sizeof(netif_));
+    return std::unexpected(TunnelError::start_failed);
+  }
+
   running_.store(true, std::memory_order_release);
+
+  ScheduleUdpExpirySweep();
 
   timeout_timer_.expires_after(kTimeoutPumpInterval);
   timeout_timer_.async_wait([this](const boost::system::error_code& ec) {
@@ -154,8 +170,11 @@ void LwipStack::StopOnExecutor() noexcept {
   }
 
   timeout_timer_.cancel();
+  udp_expiry_timer_.cancel();
+  udp_expiry_scheduled_ = false;
 
   StopTcpFlows();
+  StopUdpFlows();
 
   if (netif_added_) {
     netif_set_link_down(&netif_);
@@ -284,10 +303,6 @@ err_t LwipStack::OutputPacket(struct pbuf* p, std::uint8_t ip_version) {
     output_(std::move(batch));
   }
   return ERR_OK;
-}
-
-WriteResult LwipStack::WriteUdp(FlowId, IpEndpoint, BufferView) noexcept {
-  return WriteResult::flow_closed;
 }
 
 }  // namespace fptn::tunnel::flow

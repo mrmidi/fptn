@@ -10,6 +10,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 #include <memory>
 
 #include "fptn-protocol-lib/flow/direct_tcp_outbound.h"
+#include "fptn-protocol-lib/flow/direct_udp_outbound.h"
 #include "fptn-protocol-lib/flow/lwip_stack.h"
 #include "fptn-protocol-lib/tunnel/i_data_plane.h"
 #include "fptn-protocol-lib/tunnel/tunnel_configuration.h"
@@ -52,6 +53,7 @@ class FlowProxyDataPlane final : public IDataPlane {
   std::unique_ptr<DirectRouter> router_;
   std::unique_ptr<NullEventSink> event_sink_;
   std::unique_ptr<flow::DirectTcpOutbound> tcp_outbound_;
+  std::unique_ptr<flow::DirectUdpOutbound> udp_outbound_;
   std::unique_ptr<flow::LwipStack> stack_;
 
   std::atomic<bool> started_{false};

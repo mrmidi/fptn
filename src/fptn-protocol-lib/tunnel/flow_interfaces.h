@@ -74,4 +74,21 @@ class ITcpOutbound {
   virtual void StackWindowOpen(FlowId flow) = 0;
 };
 
+class IUdpOutboundSink {
+ public:
+  virtual ~IUdpOutboundSink() = default;
+
+  virtual void OnUdpDatagramReceived(FlowId flow, OwnedBuffer payload) = 0;
+  virtual void OnUdpReset(FlowId flow, FlowError error) = 0;
+};
+
+class IUdpOutbound {
+ public:
+  virtual ~IUdpOutbound() = default;
+
+  virtual void Open(FlowMetadata metadata, IUdpOutboundSink& sink) = 0;
+  virtual OutboundAdmission Send(FlowId flow, BufferView payload) = 0;
+  virtual void Reset(FlowId flow) = 0;
+};
+
 }  // namespace fptn::tunnel

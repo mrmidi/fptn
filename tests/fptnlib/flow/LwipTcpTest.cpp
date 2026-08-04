@@ -40,7 +40,7 @@ class LwipTcpTest : public ::testing::Test {
  protected:
   void SetUp() override {
     stack_ = std::make_unique<LwipStack>(runtime_.Executor(),
-        StackConfiguration{}, sink_, router_, outbound_,
+        StackConfiguration{}, sink_, router_, outbound_, udp_outbound_,
         [this](OwnedPacketBatch batch) { collector_.Append(std::move(batch)); });
     ASSERT_TRUE(stack_->Start().has_value());
   }
@@ -115,6 +115,7 @@ class LwipTcpTest : public ::testing::Test {
   RecordingSink sink_;
   TestRouter router_;
   FakeTcpOutbound outbound_;
+  FakeUdpOutbound udp_outbound_;
   OutputCollector collector_;
   std::unique_ptr<LwipStack> stack_;
   std::vector<OwnedPacket> packets_;

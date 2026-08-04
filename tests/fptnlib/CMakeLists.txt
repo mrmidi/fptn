@@ -61,4 +61,9 @@ if (FPTN_WITH_LWIP)
   add_executable(DirectTcpFlowTest flow/DirectTcpFlowTest.cpp)
   target_link_libraries(DirectTcpFlowTest PRIVATE ${LIBS})
   add_test(NAME DirectTcpFlowTest COMMAND DirectTcpFlowTest)
+
+  # PR-LW5: transparent UDP associations and DIRECT UDP outbound.
+  add_executable(LwipUdpTest flow/LwipUdpTest.cpp)
+  target_link_libraries(LwipUdpTest PRIVATE ${LIBS})
+  add_test(NAME LwipUdpTest COMMAND LwipUdpTest)
 endif()
