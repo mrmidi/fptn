@@ -38,6 +38,7 @@ class FPTN(ConanFile):
         "with_gui_client": [True, False],
         "build_only_fptn_lib": [True, False],
         "ios_socket_buffer_bytes": [0, 262144, 524288],
+        "with_lwip": [True, False],
     }
     default_options = {
         # --- program ---
@@ -46,6 +47,9 @@ class FPTN(ConanFile):
         "build_only_fptn_lib": False,
         # PR1A: iOS socket buffer experiment. 0 = kernel default.
         "ios_socket_buffer_bytes": 0,
+        # PR-LW1: optional lwIP flow-proxy stack. Enabled explicitly for
+        # Apple Network Extension builds (-o "fptn/*:with_lwip=True").
+        "with_lwip": False,
         # -- depends --
         "*:fPIC": True,
         "*:shared": False,
@@ -153,6 +157,8 @@ class FPTN(ConanFile):
             tc.variables["FPTN_BUILD_WITH_GUI_CLIENT"] = "True"
         if self.options.build_only_fptn_lib:
             tc.variables["FPTN_BUILD_ONLY_FPTN_LIB"] = "True"
+        if self.options.with_lwip:
+            tc.variables["FPTN_WITH_LWIP"] = "True"
         if self._use_mimalloc():
             tc.variables["FPTN_WITH_MIMALLOC"] = "True"
 
@@ -283,6 +289,9 @@ class FPTN(ConanFile):
             self.cpp_info.set_property("cmake_file_name", "fptn")
             self.cpp_info.set_property("cmake_target_name", "fptn::fptn")
             self.cpp_info.set_property("cmake_find_mode", "both")
+
+            if self.options.with_lwip:
+                self.cpp_info.defines = ["FPTN_HAS_LWIP=1"]
 
             # Add depends
             self.cpp_info.requires = [

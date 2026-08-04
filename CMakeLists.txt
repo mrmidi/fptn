@@ -37,6 +37,12 @@ if (FPTN_WITH_MIMALLOC)
     add_definitions(-DUSING_MIMALLOC)
 endif()
 
+# PR-LW1: optional HEV lwIP stack for the FlowProxy data plane.
+# Enabled explicitly for Apple Network Extension builds
+# (conan -o "fptn/*:with_lwip=True").
+option(FPTN_WITH_LWIP
+       "Build the optional lwIP flow-proxy stack into fptn-protocol-lib" OFF)
+
 if (NOT FPTN_BUILD_ONLY_FPTN_LIB)
   set(FPTN_WITH_LIBIDN2 ON)
   add_compile_definitions(FPTN_WITH_LIBIDN2)
@@ -81,6 +87,10 @@ set(FPTN_SERVER_PATH "${CMAKE_CURRENT_SOURCE_DIR}/src/fptn-server")
 include(depends/cmake/FetchBase64.cmake)
 include(depends/cmake/NtpClient.cmake)
 include(depends/cmake/CamouflageTLS.cmake)
+
+if (FPTN_WITH_LWIP)
+    include(depends/cmake/FetchLwip.cmake)
+endif()
 
 if (NOT FPTN_BUILD_ONLY_FPTN_LIB)
     if (APPLE OR UNIX)
