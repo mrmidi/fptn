@@ -11,6 +11,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 #include <future>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -38,6 +39,13 @@ void EnsureLwipInitialized() {
   std::call_once(flag, [] { lwip_init(); });
 }
 
+// lwIP global state (pcb lists, netifs, timers) supports exactly one
+// active stack instance per process.
+std::atomic<bool>& ActiveLwipStackFlag() {
+  static std::atomic<bool> active{false};
+  return active;
+}
+
 }  // namespace
 
 LwipStack::LwipStack(boost::asio::any_io_executor executor,
@@ -61,35 +69,104 @@ LwipStack::~LwipStack() {
   if (IsRunning()) {
     Stop();
   }
+  life_->alive.store(false, std::memory_order_release);
+  while (life_->in_flight.load(std::memory_order_acquire) != 0) {
+    std::this_thread::yield();
+  }
 }
 
 std::expected<void, TunnelError> LwipStack::Start() {
   if (IsRunning()) {
     return std::unexpected(TunnelError::already_running);
   }
+  bool expected = false;
+  if (!ActiveLwipStackFlag().compare_exchange_strong(expected, true)) {
+    return std::unexpected(TunnelError::already_running);
+  }
+  stop_teardown_done_.store(false, std::memory_order_release);
+
+  if (OnExecutorThread()) {
+    auto result = StartOnExecutor();
+    if (!result.has_value()) {
+      ActiveLwipStackFlag().store(false, std::memory_order_release);
+    }
+    return result;
+  }
+
   std::promise<std::expected<void, TunnelError>> done;
   auto future = done.get_future();
-  boost::asio::post(executor_, [this, &done] {
-    done.set_value(StartOnExecutor());
-  });
-  return future.get();
+  try {
+    boost::asio::post(executor_, [this, &done] {
+      done.set_value(StartOnExecutor());
+    });
+  } catch (...) {
+    ActiveLwipStackFlag().store(false, std::memory_order_release);
+    return std::unexpected(TunnelError::start_failed);
+  }
+  auto result = future.get();
+  if (!result.has_value()) {
+    ActiveLwipStackFlag().store(false, std::memory_order_release);
+  }
+  return result;
 }
 
+// NOLINTNEXTLINE(bugprone-exception-escape): rare allocation failures are caught.
 void LwipStack::Stop() noexcept {
   if (!IsRunning()) {
     return;
   }
-  try {
-    std::promise<void> done;
-    auto future = done.get_future();
-    boost::asio::post(executor_, [this, &done] {
+  auto done = std::make_shared<std::promise<void>>();
+
+  if (OnExecutorThread()) {
+    // Cannot block on the executor's own thread: run teardown inline if
+    // nothing is queued ahead, otherwise finish it asynchronously.
+    running_.store(false, std::memory_order_release);
+    if (pending_ingress_ops_.load(std::memory_order_acquire) == 0) {
       StopOnExecutor();
-      done.set_value();
-    });
-    future.get();
+    } else {
+      try {
+        boost::asio::post(executor_, [this, done] { StopDrain(done); });
+      } catch (...) {
+        StopOnExecutor();
+      }
+    }
+    return;
+  }
+
+  auto future = done->get_future();
+  try {
+    boost::asio::post(executor_, [this, done] { StopDrain(done); });
   } catch (...) {
     running_.store(false, std::memory_order_release);
+    StopDrain(done);
+    return;
   }
+  future.get();
+}
+
+// NOLINTNEXTLINE(bugprone-exception-escape): post failure is caught below.
+void LwipStack::StopDrain(
+    const std::shared_ptr<std::promise<void>>& done) noexcept {
+  running_.store(false, std::memory_order_release);
+  if (pending_ingress_ops_.load(std::memory_order_acquire) != 0) {
+    // Queued ingress handlers run before this re-posted task; retry once
+    // they have all executed.
+    try {
+      boost::asio::post(executor_, [this, done] { StopDrain(done); });
+      return;
+    } catch (const std::bad_alloc&) {
+      StopOnExecutor();
+      done->set_value();
+      return;
+    }
+  }
+  StopOnExecutor();
+  done->set_value();
+}
+
+bool LwipStack::OnExecutorThread() const noexcept {
+  return executor_thread_id_ != std::thread::id{} &&
+         std::this_thread::get_id() == executor_thread_id_;
 }
 
 std::expected<void, TunnelError> LwipStack::StartOnExecutor() {
@@ -156,18 +233,16 @@ std::expected<void, TunnelError> LwipStack::StartOnExecutor() {
   running_.store(true, std::memory_order_release);
 
   ScheduleUdpExpirySweep();
-
-  timeout_timer_.expires_after(kTimeoutPumpInterval);
-  timeout_timer_.async_wait([this](const boost::system::error_code& ec) {
-    PumpTimeouts(ec);
-  });
+  ScheduleTimeoutPump();
   return {};
 }
 
+// NOLINTNEXTLINE(bugprone-exception-escape): atomic/flag teardown cannot throw.
 void LwipStack::StopOnExecutor() noexcept {
-  if (!running_.exchange(false, std::memory_order_acq_rel)) {
+  if (stop_teardown_done_.exchange(true, std::memory_order_acq_rel)) {
     return;
   }
+  running_.store(false, std::memory_order_release);
 
   timeout_timer_.cancel();
   udp_expiry_timer_.cancel();
@@ -183,6 +258,8 @@ void LwipStack::StopOnExecutor() noexcept {
     netif_added_ = false;
     std::memset(&netif_, 0, sizeof(netif_));
   }
+
+  ActiveLwipStackFlag().store(false, std::memory_order_release);
 }
 
 void LwipStack::PumpTimeouts(const boost::system::error_code& ec) {
@@ -190,10 +267,24 @@ void LwipStack::PumpTimeouts(const boost::system::error_code& ec) {
     return;
   }
   sys_check_timeouts();
+  ScheduleTimeoutPump();
+}
+
+void LwipStack::ScheduleTimeoutPump() {
   timeout_timer_.expires_after(kTimeoutPumpInterval);
-  timeout_timer_.async_wait([this](const boost::system::error_code& next_ec) {
-    PumpTimeouts(next_ec);
-  });
+  std::weak_ptr<StackLifeToken> weak_life = life_;
+  timeout_timer_.async_wait(
+      [this, weak_life](const boost::system::error_code& next_ec) {
+        auto life = weak_life.lock();
+        if (!life) {
+          return;
+        }
+        life->in_flight.fetch_add(1, std::memory_order_acq_rel);
+        if (life->alive.load(std::memory_order_acquire)) {
+          PumpTimeouts(next_ec);
+        }
+        life->in_flight.fetch_sub(1, std::memory_order_acq_rel);
+      });
 }
 
 PacketInputResult LwipStack::InputPackets(PacketBatchView packets) noexcept {
@@ -204,7 +295,7 @@ PacketInputResult LwipStack::InputPackets(PacketBatchView packets) noexcept {
   std::uint64_t total_bytes = 0;
   for (const auto& lease : packets) {
     if (lease.bytes == nullptr || lease.length == 0 ||
-        lease.length > 0xFFFFu) {
+        lease.length > 0xFFFFU) {
       return PacketInputResult::invalid_packet;
     }
     if (lease.ip_version != 0 && lease.ip_version != 4 &&
@@ -221,35 +312,57 @@ PacketInputResult LwipStack::InputPackets(PacketBatchView packets) noexcept {
     return PacketInputResult::queue_full;
   }
 
-  auto pending = std::make_shared<std::vector<std::vector<std::uint8_t>>>();
-  pending->reserve(packets.size());
-  for (const auto& lease : packets) {
-    pending->emplace_back(lease.bytes, lease.bytes + lease.length);
+  // Reserve the operation slot, then re-check the running flag so Stop can
+  // drain every accepted operation before tearing down the netif.
+  pending_ingress_ops_.fetch_add(1, std::memory_order_acq_rel);
+  if (!running_.load(std::memory_order_acquire)) {
+    pending_ingress_ops_.fetch_sub(1, std::memory_order_release);
+    inflight_bytes_.fetch_sub(total_bytes, std::memory_order_acq_rel);
+    return PacketInputResult::transport_stopped;
   }
-  counters_.input_packets.fetch_add(packets.size(), std::memory_order_relaxed);
-  counters_.input_bytes.fetch_add(total_bytes, std::memory_order_relaxed);
 
   try {
+    auto pending = std::make_shared<std::vector<std::vector<std::uint8_t>>>();
+    pending->reserve(packets.size());
+    for (const auto& lease : packets) {
+      pending->emplace_back(lease.bytes, lease.bytes + lease.length);
+    }
+    counters_.input_packets.fetch_add(packets.size(), std::memory_order_relaxed);
+    counters_.input_bytes.fetch_add(total_bytes, std::memory_order_relaxed);
+    // Staging copy (lease bytes are only guaranteed valid for this call).
+    counters_.ingress_copy_packets.fetch_add(
+        packets.size(), std::memory_order_relaxed);
+    counters_.ingress_copy_bytes.fetch_add(
+        total_bytes, std::memory_order_relaxed);
+
     boost::asio::post(executor_, [this, pending, total_bytes] {
-      for (const auto& data : *pending) {
-        struct pbuf* p = pbuf_alloc(
-            PBUF_RAW, static_cast<u16_t>(data.size()), PBUF_RAM);
-        if (p == nullptr) {
-          counters_.dropped_packets.fetch_add(1, std::memory_order_relaxed);
-          continue;
+      if (running_.load(std::memory_order_acquire)) {
+        for (const auto& data : *pending) {
+          struct pbuf* p = pbuf_alloc(
+              PBUF_RAW, static_cast<u16_t>(data.size()), PBUF_RAM);
+          if (p == nullptr) {
+            counters_.dropped_packets.fetch_add(1, std::memory_order_relaxed);
+            continue;
+          }
+          std::memcpy(p->payload, data.data(), data.size());
+          // Second copy into the pbuf payload.
+          counters_.ingress_copy_packets.fetch_add(
+              1, std::memory_order_relaxed);
+          counters_.ingress_copy_bytes.fetch_add(
+              data.size(), std::memory_order_relaxed);
+          if (ip_input(p, &netif_) != ERR_OK) {
+            pbuf_free(p);
+          }
         }
-        std::memcpy(p->payload, data.data(), data.size());
-        counters_.ingress_copy_packets.fetch_add(
-            1, std::memory_order_relaxed);
-        counters_.ingress_copy_bytes.fetch_add(
-            data.size(), std::memory_order_relaxed);
-        if (ip_input(p, &netif_) != ERR_OK) {
-          pbuf_free(p);
-        }
+      } else {
+        counters_.dropped_packets.fetch_add(
+            pending->size(), std::memory_order_relaxed);
       }
       inflight_bytes_.fetch_sub(total_bytes, std::memory_order_acq_rel);
+      pending_ingress_ops_.fetch_sub(1, std::memory_order_release);
     });
   } catch (...) {
+    pending_ingress_ops_.fetch_sub(1, std::memory_order_release);
     inflight_bytes_.fetch_sub(total_bytes, std::memory_order_acq_rel);
     return PacketInputResult::queue_full;
   }

@@ -53,8 +53,12 @@ err_t LwipStack::StartUdpListener() {
   return ERR_OK;
 }
 
-void LwipStack::OnUdpDropRecv(void*, struct udp_pcb*, struct pbuf* p,
+void LwipStack::OnUdpDropRecv(void* arg, struct udp_pcb*, struct pbuf* p,
     const ip_addr_t*, u16_t) {
+  auto* self = static_cast<LwipStack*>(arg);
+  if (self != nullptr) {
+    self->counters_.udp_drops.fetch_add(1, std::memory_order_relaxed);
+  }
   if (p != nullptr) {
     pbuf_free(p);
   }
@@ -108,7 +112,26 @@ void LwipStack::DestroyUdpFlow(FlowId flow) noexcept {
   }
 }
 
-void LwipStack::OnUdpAccept(void* arg, struct udp_pcb* pcb, struct pbuf* p,
+// NOLINTNEXTLINE(bugprone-exception-escape): rare push_back failure tolerated.
+void LwipStack::AbandonUdpFlowToRejected(FlowId flow) noexcept {
+  const auto it = udp_flows_.find(flow);
+  if (it == udp_flows_.end()) {
+    return;
+  }
+  struct udp_pcb* pcb = it->second->pcb;
+  it->second->pcb = nullptr;
+  udp_flows_.erase(it);
+  counters_.active_udp_flows.fetch_sub(1, std::memory_order_relaxed);
+
+  if (pcb != nullptr) {
+    // Keep the pcb installed with a dropping handler so the fork's accept
+    // loop finds a matching pcb and does not recreate one per datagram.
+    udp_recv(pcb, &LwipStack::OnUdpDropRecv, this);
+    rejected_udp_pcbs_.push_back(pcb);
+  }
+}
+
+void LwipStack::OnUdpAccept(void* arg, struct udp_pcb* pcb, struct pbuf* /*p*/,
     const ip_addr_t* addr, u16_t port) {
   auto* self = static_cast<LwipStack*>(arg);
   if (self == nullptr || pcb == nullptr || !self->IsRunning()) {
@@ -121,7 +144,7 @@ void LwipStack::OnUdpAccept(void* arg, struct udp_pcb* pcb, struct pbuf* p,
     // pcb here would loop forever, so keep it with a dropping recv handler
     // until an association slot frees up.
     self->counters_.udp_drops.fetch_add(1, std::memory_order_relaxed);
-    udp_recv(pcb, &LwipStack::OnUdpDropRecv, nullptr);
+    udp_recv(pcb, &LwipStack::OnUdpDropRecv, self);
     self->rejected_udp_pcbs_.push_back(pcb);
     return;
   }
@@ -159,13 +182,21 @@ void LwipStack::OnUdpAccept(void* arg, struct udp_pcb* pcb, struct pbuf* p,
 
   udp_recv(pcb, &LwipStack::OnUdpFlowRecv, state);
 
+  // The fork re-dispatches the current datagram after this callback returns
+  // and expects the generated pcb to still be in the pcb list. Nothing in
+  // this section may remove it synchronously: rejected tuples are abandoned
+  // to the drop list, and outbound resets detected via udp_in_accept_ are
+  // abandoned the same way.
+  self->udp_in_accept_ = true;
   const RouteAction action = self->router_.Match(state->metadata);
   if (action != RouteAction::direct) {
     self->counters_.udp_drops.fetch_add(1, std::memory_order_relaxed);
-    self->DestroyUdpFlow(state->id);
+    self->AbandonUdpFlowToRejected(state->id);
+    self->udp_in_accept_ = false;
     return;
   }
   self->udp_outbound_.Open(state->metadata, *self);
+  self->udp_in_accept_ = false;
 }
 
 void LwipStack::OnUdpFlowRecv(void* arg, struct udp_pcb*, struct pbuf* p,
@@ -192,7 +223,7 @@ void LwipStack::OnUdpFlowRecv(void* arg, struct udp_pcb*, struct pbuf* p,
   }
 
   self.sink_.OnUdpDatagram(flow->metadata, payload);
-  const BufferView view{payload.data(), payload.size()};
+  const BufferView view{.data = payload.data(), .size = payload.size()};
   if (self.udp_outbound_.Send(flow->id, view) !=
       OutboundAdmission::accepted) {
     self.counters_.udp_drops.fetch_add(1, std::memory_order_relaxed);
@@ -203,7 +234,7 @@ WriteResult LwipStack::WriteUdp(
     FlowId flow_id, IpEndpoint, BufferView payload) noexcept {
   LwipUdpFlow* flow = FindUdpFlow(flow_id);
   if (flow == nullptr || flow->pcb == nullptr || payload.size == 0 ||
-      payload.size > 0xFFFFu - 8u) {
+      payload.size > 0xFFFFU - 8U) {
     return WriteResult::flow_closed;
   }
 
@@ -224,13 +255,19 @@ void LwipStack::OnUdpDatagramReceived(FlowId flow_id, OwnedBuffer payload) {
   if (payload.empty()) {
     return;
   }
-  const BufferView view{payload.data(), payload.size()};
+  const BufferView view{.data = payload.data(), .size = payload.size()};
   if (WriteUdp(flow_id, IpEndpoint{}, view) != WriteResult::accepted) {
     counters_.udp_drops.fetch_add(1, std::memory_order_relaxed);
   }
 }
 
 void LwipStack::OnUdpReset(FlowId flow_id, FlowError) {
+  if (udp_in_accept_) {
+    // Called synchronously from the outbound's Open() during the accept
+    // dispatch: the generated pcb must survive the fork's re-dispatch.
+    AbandonUdpFlowToRejected(flow_id);
+    return;
+  }
   DestroyUdpFlow(flow_id);
 }
 
@@ -240,8 +277,19 @@ void LwipStack::ScheduleUdpExpirySweep() {
   }
   udp_expiry_scheduled_ = true;
   udp_expiry_timer_.expires_after(config_.udp_idle_timeout);
+  std::weak_ptr<StackLifeToken> weak_life = life_;
   udp_expiry_timer_.async_wait(
-      [this](const boost::system::error_code& ec) { UdpExpirySweep(ec); });
+      [this, weak_life](const boost::system::error_code& ec) {
+        auto life = weak_life.lock();
+        if (!life) {
+          return;
+        }
+        life->in_flight.fetch_add(1, std::memory_order_acq_rel);
+        if (life->alive.load(std::memory_order_acquire)) {
+          UdpExpirySweep(ec);
+        }
+        life->in_flight.fetch_sub(1, std::memory_order_acq_rel);
+      });
 }
 
 void LwipStack::UdpExpirySweep(const boost::system::error_code& ec) {

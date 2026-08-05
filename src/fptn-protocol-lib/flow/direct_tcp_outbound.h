@@ -38,10 +38,16 @@ class DirectTcpOutbound final : public ITcpOutbound {
   void Finish(FlowId flow) override;
   void Reset(FlowId flow) override;
   void StackWindowOpen(FlowId flow) override;
+  void Complete(FlowId flow) override;
 
   void Stop() noexcept;
   std::uint64_t ActiveFlows() const noexcept {
     return active_flows_.load(std::memory_order_relaxed);
+  }
+  // Monotonic count of flows ever opened; lets tests observe a flow that
+  // may open and close faster than the polling interval.
+  std::uint64_t OpenedTotal() const noexcept {
+    return opened_total_.load(std::memory_order_relaxed);
   }
 
  private:
@@ -59,6 +65,7 @@ class DirectTcpOutbound final : public ITcpOutbound {
     bool connected = false;
     bool writing = false;
     bool tx_shutdown_requested = false;
+    bool tx_shutdown_done = false;
     bool rx_eof = false;
     bool read_scheduled = false;
     bool closed = false;
@@ -68,15 +75,17 @@ class DirectTcpOutbound final : public ITcpOutbound {
   void OnConnect(FlowId flow, const boost::system::error_code& ec);
   void StartWrite(FlowId flow);
   void OnWriteDone(FlowId flow, const boost::system::error_code& ec);
+  static void MaybeShutdownSend(FlowState& state);
   void StartRead(FlowState& state);
   void OnRead(FlowId flow, const boost::system::error_code& ec,
       std::size_t length);
-  bool DeliverHeldRead(FlowState& state);
+  static bool DeliverHeldRead(FlowState& state);
   void CloseFlow(FlowId flow) noexcept;
 
   boost::asio::any_io_executor executor_;
   std::unordered_map<FlowId, std::unique_ptr<FlowState>> flows_;
   std::atomic<std::uint64_t> active_flows_{0};
+  std::atomic<std::uint64_t> opened_total_{0};
   bool stopping_ = false;
 };
 

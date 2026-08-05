@@ -43,6 +43,7 @@ void DirectTcpOutbound::Open(FlowMetadata metadata, ITcpOutboundSink& sink) {
 
   flows_.emplace(flow, std::move(state));
   active_flows_.fetch_add(1, std::memory_order_relaxed);
+  opened_total_.fetch_add(1, std::memory_order_relaxed);
 
   const boost::asio::ip::tcp::endpoint endpoint{
       metadata.destination.address, metadata.destination.port};
@@ -68,17 +69,17 @@ void DirectTcpOutbound::OnConnect(
     return;
   }
   state->connected = true;
-  if (state->tx_shutdown_requested) {
-    boost::system::error_code shutdown_ec;
-    state->socket.shutdown(
-        boost::asio::ip::tcp::socket::shutdown_send, shutdown_ec);
-  }
   state->sink->OnOutboundConnected(flow);
   if (Find(flow) == nullptr) {
     return;
   }
   StartWrite(flow);
   FlowState* after_write = Find(flow);
+  if (after_write == nullptr) {
+    return;
+  }
+  MaybeShutdownSend(*after_write);
+  after_write = Find(flow);
   if (after_write != nullptr && !after_write->rx_eof) {
     StartRead(*after_write);
   }
@@ -116,6 +117,10 @@ OutboundAdmission DirectTcpOutbound::Write(
   return OutboundAdmission::accepted;
 }
 
+// StartWrite and OnWriteDone form an intentional asynchronous chain
+// (each completion schedules the next chunk); it is bounded by the pending
+// queue, not unbounded recursion.
+// NOLINTBEGIN(misc-no-recursion)
 void DirectTcpOutbound::StartWrite(FlowId flow) {
   FlowState* state = Find(flow);
   if (state == nullptr || state->writing || state->pending_writes.empty()) {
@@ -150,9 +155,22 @@ void DirectTcpOutbound::OnWriteDone(
     StartWrite(flow);
     return;
   }
+  MaybeShutdownSend(*state);
   if (state->queued_bytes <= kWritableLowWaterBytes) {
     state->sink->OnOutboundWritable(flow);
   }
+}
+// NOLINTEND(misc-no-recursion)
+
+void DirectTcpOutbound::MaybeShutdownSend(FlowState& state) {
+  if (!state.connected || !state.tx_shutdown_requested ||
+      state.tx_shutdown_done || state.writing ||
+      !state.pending_writes.empty()) {
+    return;
+  }
+  boost::system::error_code ec;
+  state.socket.shutdown(boost::asio::ip::tcp::socket::shutdown_send, ec);
+  state.tx_shutdown_done = true;
 }
 
 void DirectTcpOutbound::StartRead(FlowState& state) {
@@ -214,14 +232,18 @@ void DirectTcpOutbound::Finish(FlowId flow) {
     return;
   }
   state->tx_shutdown_requested = true;
-  if (!state->connected) {
-    return;
-  }
-  boost::system::error_code ec;
-  state->socket.shutdown(boost::asio::ip::tcp::socket::shutdown_send, ec);
+  MaybeShutdownSend(*state);
 }
 
 void DirectTcpOutbound::Reset(FlowId flow) {
+  FlowState* state = Find(flow);
+  if (state == nullptr) {
+    return;
+  }
+  CloseFlow(flow);
+}
+
+void DirectTcpOutbound::Complete(FlowId flow) {
   FlowState* state = Find(flow);
   if (state == nullptr) {
     return;

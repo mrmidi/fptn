@@ -22,6 +22,7 @@ namespace {
 
 constexpr int kListenBacklog = 8;
 
+// NOLINTNEXTLINE(bugprone-exception-escape): integer/bytes ctors do not throw.
 IpEndpoint ToIpEndpoint(const ip_addr_t& addr, std::uint16_t port) noexcept {
   IpEndpoint endpoint;
   endpoint.port = port;
@@ -121,11 +122,15 @@ void LwipStack::MaybeCloseFinishedFlow(LwipTcpFlow& flow) noexcept {
   }
   flow.pcb = nullptr;
 
-  const auto it = tcp_flows_.find(flow.id);
+  // Capture the id before erasing: the map owns the flow object, so the
+  // reference becomes dangling the moment erase() runs.
+  const FlowId flow_id = flow.id;
+  const auto it = tcp_flows_.find(flow_id);
   if (it != tcp_flows_.end()) {
     tcp_flows_.erase(it);
     counters_.active_tcp_flows.fetch_sub(1, std::memory_order_relaxed);
   }
+  tcp_outbound_.Complete(flow_id);
 }
 
 void LwipStack::DrainPendingToOutbound(LwipTcpFlow& flow) noexcept {
@@ -157,7 +162,7 @@ err_t LwipStack::OnTcpAccept(void* arg, struct tcp_pcb* newpcb, err_t err) {
   }
   if (!self->IsRunning()) {
     tcp_abort(newpcb);
-    return ERR_OK;
+    return ERR_ABRT;
   }
 
   auto flow = std::make_unique<LwipTcpFlow>();
@@ -194,9 +199,15 @@ err_t LwipStack::OnTcpAccept(void* arg, struct tcp_pcb* newpcb, err_t err) {
   const RouteAction action = self->router_.Match(state->metadata);
   if (action != RouteAction::direct) {
     self->ResetTcp(state->id);
-    return ERR_OK;
+    // ResetTcp aborted the pcb: lwIP must be told it is gone.
+    return ERR_ABRT;
   }
   self->tcp_outbound_.Open(state->metadata, *self);
+  if (self->FindTcpFlow(state->id) == nullptr) {
+    // The outbound reported failure synchronously and reset the flow,
+    // aborting the pcb.
+    return ERR_ABRT;
+  }
   return ERR_OK;
 }
 
@@ -226,6 +237,13 @@ err_t LwipStack::OnTcpRecv(
   }
 
   const PbufBufferSequence sequence(p);
+  if (sequence.size_bytes() != p->tot_len) {
+    // The sequence caps (segments/bytes) would silently truncate the stream;
+    // refuse the segment instead of acknowledging partial data.
+    pbuf_free(p);
+    self.ResetTcp(flow->id);
+    return ERR_ABRT;
+  }
   const OutboundAdmission admission =
       self.tcp_outbound_.Write(flow->id, sequence.View());
   if (admission == OutboundAdmission::accepted) {
@@ -234,15 +252,16 @@ err_t LwipStack::OnTcpRecv(
     return ERR_OK;
   }
   if (admission == OutboundAdmission::queue_full) {
-    flow->pending_to_outbound.push_back(
-        PendingTcpData{p, static_cast<std::uint32_t>(p->tot_len)});
+    flow->pending_to_outbound.push_back(PendingTcpData{
+        .pbuf = p, .length = static_cast<std::uint32_t>(p->tot_len)});
     self.counters_.tcp_backpressure_events.fetch_add(
         1, std::memory_order_relaxed);
     return ERR_OK;
   }
   pbuf_free(p);
   self.ResetTcp(flow->id);
-  return ERR_OK;
+  // ResetTcp aborted the pcb: lwIP must be told it is gone.
+  return ERR_ABRT;
 }
 
 err_t LwipStack::OnTcpSent(void* arg, struct tcp_pcb*, u16_t) {
@@ -326,7 +345,7 @@ bool LwipStack::OnOutboundData(FlowId flow_id, OwnedBuffer& data) {
   if (data.empty()) {
     return true;
   }
-  const BufferView view{data.data(), data.size()};
+  const BufferView view{.data = data.data(), .size = data.size()};
   const BufferSequence sequence{&view, 1};
   if (WriteTcp(flow_id, sequence) != WriteResult::accepted) {
     return false;

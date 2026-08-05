@@ -13,12 +13,19 @@ TunnelRuntime::TunnelRuntime()
 
 TunnelRuntime::~TunnelRuntime() { Stop(); }
 
-void TunnelRuntime::Start() {
-  if (running_) {
-    return;
+bool TunnelRuntime::Start() {
+  if (running_ || stopped_ever_) {
+    return false;
   }
+  std::promise<std::thread::id> id_ready;
+  auto id_future = id_ready.get_future();
+  thread_ = std::thread([this, &id_ready] {
+    id_ready.set_value(std::this_thread::get_id());
+    ioc_.run();
+  });
+  thread_id_ = id_future.get();
   running_ = true;
-  thread_ = std::thread([this] { ioc_.run(); });
+  return true;
 }
 
 void TunnelRuntime::Stop() noexcept {
@@ -26,11 +33,13 @@ void TunnelRuntime::Stop() noexcept {
     return;
   }
   running_ = false;
+  stopped_ever_ = true;
   work_.reset();
   ioc_.stop();
   if (thread_.joinable()) {
     thread_.join();
   }
+  thread_id_ = std::thread::id{};
 }
 
 }  // namespace fptn::tunnel

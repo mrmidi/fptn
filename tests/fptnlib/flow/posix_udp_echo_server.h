@@ -64,7 +64,7 @@ class PosixUdpEchoServer final {
     if (socket_fd_ >= 0) {
       ::shutdown(socket_fd_, SHUT_RDWR);
       ::close(socket_fd_);
-      socket_fd_ = -1;
+      // No write-back of socket_fd_: Run() may still read it in recvfrom().
     }
     if (thread_.joinable()) {
       thread_.join();

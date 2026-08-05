@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <boost/asio/post.hpp>
 
 #include "fptn-protocol-lib/flow/lwip_stack.h"
 #include "fptn-protocol-lib/tunnel/tunnel_engine.h"
@@ -259,6 +262,21 @@ class LwipUdpStackTest : public ::testing::Test {
     }
   }
 
+  // Runs fn on the stack executor thread and blocks until it completes.
+  // Sink/data-path methods must execute on the executor (lwIP is
+  // single-threaded), mirroring how real outbounds invoke them.
+  template <typename Fn>
+  void RunOnExecutor(Fn&& fn) {
+    std::promise<void> promise;
+    auto future = promise.get_future();
+    boost::asio::post(runtime_.Executor(),
+        [&promise, fn = std::forward<Fn>(fn)]() mutable {
+          fn();
+          promise.set_value();
+        });
+    future.get();
+  }
+
   PacketInputResult Inject(const std::vector<std::uint8_t>& packet) {
     const PacketLease lease{packet.data(),
         static_cast<std::uint32_t>(packet.size()), 4, nullptr, nullptr};
@@ -281,7 +299,8 @@ TEST_F(LwipUdpStackTest, AssociationDeliversMetadataAndPayload) {
   Inject(MakeUdpV4(kAppIp, "93.184.216.34", kAppPort, 53, payload));
 
   ASSERT_TRUE(PollUntil([this] { return !udp_outbound_.Opened().empty(); }));
-  const FlowMetadata& metadata = udp_outbound_.Opened().front();
+  const auto opened = udp_outbound_.Opened();
+  const FlowMetadata metadata = opened.front();
   EXPECT_EQ(metadata.protocol, TransportProtocol::udp);
   EXPECT_EQ(metadata.source.address.to_string(), kAppIp);
   EXPECT_EQ(metadata.source.port, kAppPort);
@@ -304,8 +323,10 @@ TEST_F(LwipUdpStackTest, ReplyFromOutboundReachesApp) {
 
   const std::vector<std::uint8_t> reply = {'r', 'e', 'p', 'l', 'y'};
   OwnedBuffer reply_buffer = reply;
-  udp_outbound_.LastSink()->OnUdpDatagramReceived(flow,
-      std::move(reply_buffer));
+  RunOnExecutor([&] {
+    udp_outbound_.LastSink()->OnUdpDatagramReceived(flow,
+        std::move(reply_buffer));
+  });
 
   ASSERT_TRUE(PollUntil([this] {
     const auto datagrams = CollectUdpOutputs(collector_.Snapshot());
@@ -341,7 +362,7 @@ TEST_F(LwipUdpStackTest, IdleAssociationExpires) {
   },
       std::chrono::seconds(5)));
   ASSERT_TRUE(PollUntil([this, flow] {
-    const auto& reset = udp_outbound_.Reset();
+    const auto reset = udp_outbound_.Reset();
     return std::find(reset.begin(), reset.end(), flow) != reset.end();
   }));
   EXPECT_EQ(stack_->counters().peak_udp_flows.load(), 1u);

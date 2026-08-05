@@ -66,4 +66,10 @@ if (FPTN_WITH_LWIP)
   add_executable(LwipUdpTest flow/LwipUdpTest.cpp)
   target_link_libraries(LwipUdpTest PRIVATE ${LIBS})
   add_test(NAME LwipUdpTest COMMAND LwipUdpTest)
+
+  # Review regressions: ERR_ABRT paths, ingress/stop race, FIN-after-data,
+  # clean-completion resource release, one-shot engine, UDP pcb retention.
+  add_executable(LwipFlowRegressionTest flow/LwipFlowRegressionTest.cpp)
+  target_link_libraries(LwipFlowRegressionTest PRIVATE ${LIBS})
+  add_test(NAME LwipFlowRegressionTest COMMAND LwipFlowRegressionTest)
 endif()

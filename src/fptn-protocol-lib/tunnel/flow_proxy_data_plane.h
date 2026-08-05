@@ -8,6 +8,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 
 #include "fptn-protocol-lib/flow/direct_tcp_outbound.h"
 #include "fptn-protocol-lib/flow/direct_udp_outbound.h"
@@ -18,6 +19,8 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 namespace fptn::tunnel {
 
+// One-shot data plane: after Stop(), Start() is rejected. Create a new
+// engine per tunnel session.
 class FlowProxyDataPlane final : public IDataPlane {
  public:
   FlowProxyDataPlane(TunnelConfiguration config, TunnelCallbacks callbacks);
@@ -30,6 +33,10 @@ class FlowProxyDataPlane final : public IDataPlane {
   void Stop() noexcept override;
 
   PacketInputResult InputPackets(PacketBatchView packets) noexcept override;
+
+  std::uint64_t ReentrantStopAttempts() const noexcept {
+    return reentrant_stop_attempts_.load(std::memory_order_relaxed);
+  }
 
  private:
   struct DirectRouter final : IFlowRouter {
@@ -54,9 +61,14 @@ class FlowProxyDataPlane final : public IDataPlane {
   std::unique_ptr<NullEventSink> event_sink_;
   std::unique_ptr<flow::DirectTcpOutbound> tcp_outbound_;
   std::unique_ptr<flow::DirectUdpOutbound> udp_outbound_;
-  std::unique_ptr<flow::LwipStack> stack_;
+  // Shared so InputPackets callers can outlive Stop() safely: they hold a
+  // local reference, observe !IsRunning(), and drop it.
+  std::shared_ptr<flow::LwipStack> stack_;
+  mutable std::mutex stack_mutex_;
 
   std::atomic<bool> started_{false};
+  bool stopped_ever_{false};
+  std::atomic<std::uint64_t> reentrant_stop_attempts_{0};
 };
 
 }  // namespace fptn::tunnel

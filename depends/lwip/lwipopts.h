@@ -56,8 +56,10 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 #endif
 #define LWIP_DONT_PROVIDE_BYTEORDER_FUNCTIONS 1
 
-/* Memory: bounded pools; ingress borrows caller buffers via custom pbufs,
- * so the pool mainly serves stack-internal and egress allocations. */
+/* Memory: bounded pools. Ingress currently copies caller bytes into
+ * PBUF_RAM (initial correctness path); zero-copy borrowed-buffer ingress
+ * via pbuf_alloced_custom is a later optimization owned by the Apple
+ * adapter. The pool mainly serves stack-internal and egress allocations. */
 #define MEM_SIZE (256 * 1024)
 #define MEMP_NUM_PBUF 512
 #define PBUF_POOL_SIZE 256

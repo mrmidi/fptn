@@ -189,7 +189,9 @@ TEST_F(LwipStackTest, CountersTrackIngressCopies) {
   const auto& counters = stack_->counters();
   EXPECT_EQ(counters.input_packets.load(), 1u);
   EXPECT_EQ(counters.input_bytes.load(), syn.size());
-  EXPECT_EQ(counters.ingress_copy_packets.load(), 1u);
+  // Two counted copy operations per packet: staging copy plus pbuf copy.
+  EXPECT_EQ(counters.ingress_copy_packets.load(), 2u);
+  EXPECT_EQ(counters.ingress_copy_bytes.load(), 2 * syn.size());
   EXPECT_GE(counters.output_packets.load(), 1u);
 }
 

@@ -209,6 +209,11 @@ class OutputCollector final {
     return packets_;
   }
 
+  void Reset() {
+    std::lock_guard lock(mutex_);
+    packets_.clear();
+  }
+
  private:
   std::mutex mutex_;
   std::condition_variable cv_;

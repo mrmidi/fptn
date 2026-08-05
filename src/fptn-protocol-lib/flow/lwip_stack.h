@@ -11,8 +11,10 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 #include <cstdint>
 #include <deque>
 #include <expected>
+#include <future>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -29,6 +31,16 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 #include "fptn-protocol-lib/tunnel/tunnel_error.h"
 
 namespace fptn::tunnel::flow {
+
+// Shared lifetime token for recurring executor callbacks (timeout pump,
+// UDP expiry sweep). A callback that locks the token keeps the token
+// alive; the stack destructor marks it dead and waits until no callback
+// is in flight before destroying members, so timer handlers can never
+// touch a destroyed stack even if the runtime outlives it.
+struct StackLifeToken {
+  std::atomic<bool> alive{true};
+  std::atomic<int> in_flight{0};
+};
 
 struct StackConfiguration {
   std::string tun_ipv4 = "10.8.0.2";
@@ -104,6 +116,11 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink,
   bool IsRunning() const noexcept {
     return running_.load(std::memory_order_acquire);
   }
+  // Thread id of the executor driving this stack, used to execute
+  // Start/Stop inline instead of deadlocking on a self-post.
+  void SetExecutorThreadId(std::thread::id id) noexcept {
+    executor_thread_id_ = id;
+  }
 
   PacketInputResult InputPackets(PacketBatchView packets) noexcept override;
 
@@ -130,8 +147,11 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink,
 
  private:
   std::expected<void, TunnelError> StartOnExecutor();
+  void StopDrain(const std::shared_ptr<std::promise<void>>& done) noexcept;
   void StopOnExecutor() noexcept;
+  bool OnExecutorThread() const noexcept;
   void PumpTimeouts(const boost::system::error_code& ec);
+  void ScheduleTimeoutPump();
 
   static err_t NetifInit(struct netif* netif);
   static err_t OutputV4(
@@ -158,6 +178,7 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink,
   void StopUdpFlows() noexcept;
   LwipUdpFlow* FindUdpFlow(FlowId flow) noexcept;
   void DestroyUdpFlow(FlowId flow) noexcept;
+  void AbandonUdpFlowToRejected(FlowId flow) noexcept;
   void ScheduleUdpExpirySweep();
   void UdpExpirySweep(const boost::system::error_code& ec);
 
@@ -178,7 +199,13 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink,
   StackCounters counters_;
 
   std::atomic<bool> running_{false};
+  std::atomic<bool> stop_teardown_done_{false};
   std::atomic<std::uint64_t> inflight_bytes_{0};
+  // Accepted-but-not-yet-executed ingress operations; Stop drains them
+  // before removing the netif.
+  std::atomic<std::uint64_t> pending_ingress_ops_{0};
+  std::thread::id executor_thread_id_{};
+  bool udp_in_accept_{false};
 
   struct netif netif_ {};
   bool netif_added_{false};
@@ -196,6 +223,8 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink,
   std::vector<struct udp_pcb*> rejected_udp_pcbs_;
   boost::asio::steady_timer udp_expiry_timer_;
   bool udp_expiry_scheduled_{false};
+
+  std::shared_ptr<StackLifeToken> life_ = std::make_shared<StackLifeToken>();
 };
 
 }  // namespace fptn::tunnel::flow

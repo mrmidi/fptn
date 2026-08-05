@@ -72,6 +72,9 @@ class ITcpOutbound {
   virtual void Finish(FlowId flow) = 0;
   virtual void Reset(FlowId flow) = 0;
   virtual void StackWindowOpen(FlowId flow) = 0;
+  // Clean completion: both directions finished, stack state erased.
+  // The outbound must release all per-flow state.
+  virtual void Complete(FlowId flow) = 0;
 };
 
 class IUdpOutboundSink {

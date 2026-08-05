@@ -2,9 +2,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
+#include <type_traits>
+
+#include <boost/asio/post.hpp>
 
 #include "fptn-protocol-lib/flow/lwip_stack.h"
 
@@ -49,6 +53,32 @@ class LwipTcpTest : public ::testing::Test {
     if (stack_) {
       stack_->Stop();
       stack_.reset();
+    }
+  }
+
+  // Runs fn on the stack executor thread and blocks until it completes.
+  // Sink/data-path methods must execute on the executor (lwIP is
+  // single-threaded), mirroring how real outbounds invoke them.
+  template <typename Fn>
+  auto RunOnExecutor(Fn&& fn) {
+    using Result = decltype(fn());
+    if constexpr (std::is_void_v<Result>) {
+      std::promise<void> promise;
+      auto future = promise.get_future();
+      boost::asio::post(runtime_.Executor(),
+          [&promise, fn = std::forward<Fn>(fn)]() mutable {
+            fn();
+            promise.set_value();
+          });
+      future.get();
+    } else {
+      auto promise = std::make_shared<std::promise<Result>>();
+      auto future = promise->get_future();
+      boost::asio::post(runtime_.Executor(),
+          [promise, fn = std::forward<Fn>(fn)]() mutable {
+            promise->set_value(fn());
+          });
+      return future.get();
     }
   }
 
@@ -127,7 +157,7 @@ TEST_F(LwipTcpTest, HandshakeOpensFlowAndRoutesDirect) {
   ASSERT_TRUE(DoHandshake());
 
   ASSERT_EQ(sink_.Opened().size(), 1u);
-  const FlowMetadata& metadata = sink_.Opened().front();
+  const FlowMetadata metadata = sink_.Opened().front();
   EXPECT_EQ(metadata.protocol, TransportProtocol::tcp);
   EXPECT_EQ(metadata.source.address.to_string(), kAppIp);
   EXPECT_EQ(metadata.source.port, kAppPort);
@@ -148,10 +178,10 @@ TEST_F(LwipTcpTest, AppDataDeliveredToOutboundAndAcked) {
       server_seq_, kFlagAck, bytes));
 
   ASSERT_TRUE(PollUntil([this, &payload] {
-    return !outbound_.Written().empty() &&
-           outbound_.Written().front().flow == OpenedFlow() &&
-           std::string(outbound_.Written().front().bytes.begin(),
-               outbound_.Written().front().bytes.end()) == payload;
+    const auto written = outbound_.Written();
+    return !written.empty() && written.front().flow == OpenedFlow() &&
+           std::string(written.front().bytes.begin(),
+               written.front().bytes.end()) == payload;
   }));
 
   const std::uint32_t expected_ack = client_seq_ +
@@ -175,7 +205,9 @@ TEST_F(LwipTcpTest, OutboundDataReachesApp) {
   const std::string payload = "world";
   const FlowId flow = OpenedFlow();
   OwnedBuffer data(payload.begin(), payload.end());
-  EXPECT_TRUE(OutboundSink()->OnOutboundData(flow, data));
+  const bool accepted = RunOnExecutor(
+      [&] { return OutboundSink()->OnOutboundData(flow, data); });
+  EXPECT_TRUE(accepted);
   EXPECT_TRUE(data.empty());
 
   ASSERT_TRUE(collector_.WaitFor(2,
@@ -220,14 +252,15 @@ TEST_F(LwipTcpTest, BackpressureHoldsDataUntilOutboundAdmits) {
   EXPECT_GE(stack_->counters().tcp_backpressure_events.load(), 1u);
 
   outbound_.SetRejectWrites(false);
-  OutboundSink()->OnOutboundWritable(OpenedFlow());
+  RunOnExecutor([this] { OutboundSink()->OnOutboundWritable(OpenedFlow()); });
 
   ASSERT_TRUE(PollUntil([this, &payload] {
-    if (outbound_.Written().empty()) {
+    const auto written = outbound_.Written();
+    if (written.empty()) {
       return false;
     }
-    const auto& written = outbound_.Written().front();
-    return std::string(written.bytes.begin(), written.bytes.end()) == payload;
+    return std::string(written.front().bytes.begin(),
+               written.front().bytes.end()) == payload;
   }));
 
   const std::uint32_t data_ack = client_seq_ +
@@ -252,7 +285,7 @@ TEST_F(LwipTcpTest, AppFinPropagatesAndFlowCloses) {
       server_seq_, kFlagFin | kFlagAck));
 
   ASSERT_TRUE(PollUntil([this, flow] {
-    const auto& finished = outbound_.Finished();
+    const auto finished = outbound_.Finished();
     return std::find(finished.begin(), finished.end(), flow) !=
         finished.end();
   }));
@@ -270,7 +303,7 @@ TEST_F(LwipTcpTest, AppFinPropagatesAndFlowCloses) {
         return false;
       }));
 
-  OutboundSink()->OnOutboundFinished(flow);
+  RunOnExecutor([this, flow] { OutboundSink()->OnOutboundFinished(flow); });
 
   ASSERT_TRUE(collector_.WaitFor(3,
       [fin_ack](const std::vector<OwnedPacket>& packets) {
@@ -292,7 +325,8 @@ TEST_F(LwipTcpTest, OutboundResetProducesRstToApp) {
   const FlowId flow = OpenedFlow();
   ASSERT_EQ(stack_->ActiveTcpFlows(), 1u);
 
-  OutboundSink()->OnOutboundReset(flow, FlowError::reset);
+  RunOnExecutor(
+      [this, flow] { OutboundSink()->OnOutboundReset(flow, FlowError::reset); });
 
   ASSERT_TRUE(collector_.WaitFor(2,
       [](const std::vector<OwnedPacket>& packets) {

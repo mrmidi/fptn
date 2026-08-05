@@ -6,6 +6,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 #include "fptn-protocol-lib/flow/direct_udp_outbound.h"
 
+#include <new>
 #include <utility>
 
 namespace fptn::tunnel::flow {
@@ -21,19 +22,33 @@ void DirectUdpOutbound::Open(FlowMetadata metadata, IUdpOutboundSink& sink) {
     return;
   }
 
+  const FlowId flow = metadata.id;
+  auto report_failure = [this, &sink, flow](FlowError error) {
+    // Report asynchronously: Open() runs inside the stack's UDP accept
+    // dispatch, and the generated lwIP pcb must survive that dispatch.
+    try {
+      boost::asio::post(executor_, [&sink, flow, error] {
+        sink.OnUdpReset(flow, error);
+      });
+    // NOLINTNEXTLINE(bugprone-empty-catch): allocation failure drops the reset.
+    } catch (const std::bad_alloc&) {
+      // Post can only fail from allocation failure during shutdown; the
+      // flow is dropped without a reset notification.
+    }
+  };
+
   auto state = std::make_unique<FlowState>(executor_);
   state->id = metadata.id;
   state->sink = &sink;
   state->rx_buffer.resize(kReadBufferSize);
 
-  const FlowId flow = metadata.id;
   boost::system::error_code ec;
   const auto protocol = metadata.destination.address.is_v4()
                             ? boost::asio::ip::udp::v4()
                             : boost::asio::ip::udp::v6();
   state->socket.open(protocol, ec);
   if (ec) {
-    sink.OnUdpReset(flow, FlowError::outbound_failure);
+    report_failure(FlowError::outbound_failure);
     return;
   }
 
@@ -41,7 +56,9 @@ void DirectUdpOutbound::Open(FlowMetadata metadata, IUdpOutboundSink& sink) {
       metadata.destination.address, metadata.destination.port};
   state->socket.connect(endpoint, ec);
   if (ec) {
-    sink.OnUdpReset(flow, FlowError::outbound_failure);
+    boost::system::error_code close_ec;
+    state->socket.close(close_ec);
+    report_failure(FlowError::outbound_failure);
     return;
   }
 
