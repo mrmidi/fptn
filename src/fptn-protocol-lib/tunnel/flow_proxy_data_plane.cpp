@@ -75,18 +75,21 @@ std::expected<void, TunnelError> FlowProxyDataPlane::Start() {
 
 // NOLINTNEXTLINE(bugprone-exception-escape): rare allocation failures are caught.
 void FlowProxyDataPlane::Stop() noexcept {
+  if (runtime_.IsCurrentThread()) {
+    // Stopping from within the runtime thread cannot join the runtime and
+    // cannot safely drain stack state synchronously. Reject WITHOUT changing
+    // state: clearing started_ here would leave the plane logically stopped
+    // but physically running, and every later external Stop() would become a
+    // no-op, making teardown unrecoverable. The counter records the contract
+    // violation; a later external Stop() still performs full teardown.
+    reentrant_stop_attempts_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
   if (!started_.exchange(false, std::memory_order_acq_rel)) {
     return;
   }
   stopped_ever_ = true;
-
-  if (runtime_.IsCurrentThread()) {
-    // Stopping from within the runtime thread cannot join the runtime and
-    // cannot safely drain stack state synchronously. Reject: the engine is
-    // one-shot, and a reentrant stop is a caller contract violation.
-    reentrant_stop_attempts_.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
 
   std::shared_ptr<flow::LwipStack> stack;
   {
@@ -126,6 +129,19 @@ void FlowProxyDataPlane::Stop() noexcept {
   udp_outbound_.reset();
   router_.reset();
   event_sink_.reset();
+}
+
+std::uint64_t FlowProxyDataPlane::ActiveTcpFlowsForTesting() const noexcept {
+  std::scoped_lock lock(stack_mutex_);
+  return stack_ == nullptr ? 0 : stack_->ActiveTcpFlows();
+}
+
+std::uint64_t FlowProxyDataPlane::ActiveUdpFlowsForTesting() const noexcept {
+  std::scoped_lock lock(stack_mutex_);
+  return stack_ == nullptr
+             ? 0
+             : stack_->counters().active_udp_flows.load(
+                   std::memory_order_relaxed);
 }
 
 PacketInputResult FlowProxyDataPlane::InputPackets(

@@ -38,6 +38,16 @@ class FlowProxyDataPlane final : public IDataPlane {
     return reentrant_stop_attempts_.load(std::memory_order_relaxed);
   }
 
+  // Test-only accessors for lifecycle assertions (reentrant stop, teardown).
+  boost::asio::any_io_executor RuntimeExecutorForTesting() {
+    return runtime_.Executor();
+  }
+  bool IsStartedForTesting() const noexcept {
+    return started_.load(std::memory_order_acquire);
+  }
+  std::uint64_t ActiveTcpFlowsForTesting() const noexcept;
+  std::uint64_t ActiveUdpFlowsForTesting() const noexcept;
+
  private:
   struct DirectRouter final : IFlowRouter {
     RouteAction Match(const FlowMetadata&) override {

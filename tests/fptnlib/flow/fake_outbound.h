@@ -25,6 +25,12 @@ class FakeTcpOutbound final : public ITcpOutbound {
   };
 
   void Open(FlowMetadata metadata, ITcpOutboundSink& sink) override {
+    if (fail_open_) {
+      // Synchronous failure inside the stack's accept dispatch: exercises
+      // the re-entrant ResetTcp path during Open().
+      sink.OnOutboundReset(metadata.id, FlowError::outbound_failure);
+      return;
+    }
     {
       std::lock_guard lock(mutex_);
       opened_.push_back(OpenedFlow{metadata, &sink});
@@ -81,6 +87,10 @@ class FakeTcpOutbound final : public ITcpOutbound {
     std::lock_guard lock(mutex_);
     auto_admit_open_ = auto_admit;
   }
+  void SetFailOpen(bool fail) {
+    std::lock_guard lock(mutex_);
+    fail_open_ = fail;
+  }
 
   std::vector<OpenedFlow> Opened() const {
     std::lock_guard lock(mutex_);
@@ -123,6 +133,7 @@ class FakeTcpOutbound final : public ITcpOutbound {
   bool reject_writes_ = false;
   bool closed_ = false;
   bool auto_admit_open_ = false;
+  bool fail_open_ = false;
 };
 
 class FakeUdpOutbound final : public IUdpOutbound {

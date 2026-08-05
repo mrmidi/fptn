@@ -155,6 +155,12 @@ void DirectTcpOutbound::OnWriteDone(
     StartWrite(flow);
     return;
   }
+  if (state->complete_requested) {
+    // Complete() was deferred while writes were in flight; all bytes are
+    // written now, so the socket can close.
+    CloseFlow(flow);
+    return;
+  }
   MaybeShutdownSend(*state);
   if (state->queued_bytes <= kWritableLowWaterBytes) {
     state->sink->OnOutboundWritable(flow);
@@ -246,6 +252,13 @@ void DirectTcpOutbound::Reset(FlowId flow) {
 void DirectTcpOutbound::Complete(FlowId flow) {
   FlowState* state = Find(flow);
   if (state == nullptr) {
+    return;
+  }
+  // Closing the socket now would cancel queued/in-flight writes and drop
+  // bytes the stack already considers delivered. Defer until the write
+  // chain drains (OnWriteDone honors complete_requested).
+  if (state->writing || !state->pending_writes.empty()) {
+    state->complete_requested = true;
     return;
   }
   CloseFlow(flow);

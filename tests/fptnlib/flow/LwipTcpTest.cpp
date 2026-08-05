@@ -105,9 +105,10 @@ class LwipTcpTest : public ::testing::Test {
     return nullptr;
   }
 
-  bool DoHandshake() {
+  bool DoHandshake(
+      std::uint16_t app_port = kAppPort, std::uint32_t iss = kClientIss) {
     Inject(MakeTcpV4(
-        kAppIp, kDstIp, kAppPort, kDstPort, kClientIss, 0, kFlagSyn));
+        kAppIp, kDstIp, app_port, kDstPort, iss, 0, kFlagSyn));
 
     bool got_synack = collector_.WaitFor(1,
         [this](const std::vector<OwnedPacket>& packets) {
@@ -124,8 +125,8 @@ class LwipTcpTest : public ::testing::Test {
       return false;
     }
 
-    client_seq_ = kClientIss + 1;
-    Inject(MakeTcpV4(kAppIp, kDstIp, kAppPort, kDstPort, client_seq_,
+    client_seq_ = iss + 1;
+    Inject(MakeTcpV4(kAppIp, kDstIp, app_port, kDstPort, client_seq_,
         server_seq_, kFlagAck));
 
     return PollUntil([this] { return !outbound_.Opened().empty(); });
@@ -340,6 +341,142 @@ TEST_F(LwipTcpTest, OutboundResetProducesRstToApp) {
       }));
   ASSERT_TRUE(PollUntil([this] { return stack_->ActiveTcpFlows() == 0; }));
   EXPECT_GE(stack_->counters().tcp_resets.load(), 1u);
+}
+
+// Review P0-1: Open() failing synchronously re-enters ResetTcp() during
+// OnTcpAccept and erases the map-owned flow. The accept callback must not
+// touch the freed flow state afterwards (ASan-verified) and must emit RST.
+TEST_F(LwipTcpTest, SyncTcpOpenFailureDoesNotUseFreedFlow) {
+  outbound_.SetFailOpen(true);
+
+  Inject(MakeTcpV4(
+      kAppIp, kDstIp, kAppPort, kDstPort, kClientIss, 0, kFlagSyn));
+  std::uint32_t server_seq = 0;
+  ASSERT_TRUE(collector_.WaitFor(1,
+      [&server_seq](const std::vector<OwnedPacket>& packets) {
+        for (const auto& packet : packets) {
+          if (packet.ip_version == 4 && packet.data.size() >= 40 &&
+              (ReadFlags(packet.data, 20) & kFlagSyn) != 0) {
+            server_seq = ReadSeq(packet.data, 20) + 1;
+            return true;
+          }
+        }
+        return false;
+      }));
+  Inject(MakeTcpV4(kAppIp, kDstIp, kAppPort, kDstPort, kClientIss + 1,
+      server_seq, kFlagAck));
+
+  ASSERT_TRUE(collector_.WaitFor(2,
+      [](const std::vector<OwnedPacket>& packets) {
+        for (const auto& packet : packets) {
+          if (packet.ip_version == 4 && packet.data.size() >= 40 &&
+              (ReadFlags(packet.data, 20) & kFlagRst) != 0) {
+            return true;
+          }
+        }
+        return false;
+      }));
+  ASSERT_TRUE(PollUntil([this] { return stack_->ActiveTcpFlows() == 0; }));
+  EXPECT_TRUE(outbound_.Opened().empty());
+  EXPECT_GE(stack_->counters().tcp_resets.load(), 1u);
+
+  // The stack stays usable after the failed connection. Clear the collector
+  // so the second handshake's SYN-ACK wait does not match the stale first
+  // SYN-ACK (which would yield a wrong server seq).
+  outbound_.SetFailOpen(false);
+  collector_.Reset();
+  ASSERT_TRUE(DoHandshake(kAppPort + 1, kClientIss + 0x1000));
+  EXPECT_EQ(stack_->ActiveTcpFlows(), 1u);
+}
+
+namespace {
+
+std::atomic<int> g_tcp_close_calls{0};
+std::atomic<int> g_tcp_abort_calls{0};
+
+err_t FailTcpClose(struct tcp_pcb*) {
+  g_tcp_close_calls.fetch_add(1, std::memory_order_relaxed);
+  return ERR_MEM;
+}
+
+void RecordTcpAbort(struct tcp_pcb*) {
+  g_tcp_abort_calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+}  // namespace
+
+// Review P0-2: when tcp_close() fails (data still queued/unacked), the pcb
+// is aborted and the enclosing lwIP callback must return ERR_ABRT. The
+// behavioral proof is the abort counter plus flow teardown; returning
+// ERR_OK instead would leave lwIP touching the freed pcb, which ASan
+// catches.
+TEST_F(LwipTcpTest, CloseFailureAbortsPcbAndReturnsErrAbrt) {
+  g_tcp_close_calls.store(0);
+  g_tcp_abort_calls.store(0);
+  stack_->SetTcpApiForTesting(
+      LwipTcpApi{.close = &FailTcpClose, .abort = &RecordTcpAbort});
+
+  ASSERT_TRUE(DoHandshake());
+  const FlowId flow = OpenedFlow();
+
+  // Outbound finishes first (remote EOF) so the application FIN is the last
+  // missing condition and triggers the close path.
+  RunOnExecutor([this, flow] { OutboundSink()->OnOutboundFinished(flow); });
+
+  Inject(MakeTcpV4(kAppIp, kDstIp, kAppPort, kDstPort, client_seq_,
+      server_seq_, kFlagFin | kFlagAck));
+
+  // Ingress is processed on the stack executor; wait for the close path.
+  ASSERT_TRUE(PollUntil([] { return g_tcp_close_calls.load() >= 1; }));
+  EXPECT_EQ(g_tcp_abort_calls.load(), 1);
+  ASSERT_TRUE(PollUntil([this] { return stack_->ActiveTcpFlows() == 0; }));
+  const auto completed = outbound_.Completed();
+  EXPECT_NE(std::find(completed.begin(), completed.end(), flow),
+      completed.end());
+}
+
+// Review P1-3: an application FIN arriving while lwIP still retains a
+// backpressured pbuf must not forward Finish() to the outbound early; the
+// retained bytes must be admitted first, then Finish follows.
+TEST_F(LwipTcpTest, FinWaitsUntilRetainedDataIsAdmitted) {
+  ASSERT_TRUE(DoHandshake());
+  const FlowId flow = OpenedFlow();
+
+  outbound_.SetRejectWrites(true);
+
+  const std::string payload = "not lost";
+  const std::vector<std::uint8_t> bytes(payload.begin(), payload.end());
+  Inject(MakeTcpV4(kAppIp, kDstIp, kAppPort, kDstPort, client_seq_,
+      server_seq_, kFlagAck, bytes));
+  ASSERT_TRUE(PollUntil([this] {
+    return stack_->counters().tcp_backpressure_events.load() >= 1;
+  }));
+
+  // FIN while the pbuf is retained: neither data nor Finish may reach the
+  // outbound yet.
+  Inject(MakeTcpV4(kAppIp, kDstIp, kAppPort, kDstPort,
+      client_seq_ + static_cast<std::uint32_t>(bytes.size()), server_seq_,
+      kFlagFin | kFlagAck));
+  EXPECT_FALSE(PollUntil(
+      [this] {
+        return !outbound_.Written().empty() || !outbound_.Finished().empty();
+      },
+      std::chrono::milliseconds(300)));
+
+  outbound_.SetRejectWrites(false);
+  RunOnExecutor([this, flow] { OutboundSink()->OnOutboundWritable(flow); });
+
+  ASSERT_TRUE(PollUntil([this, &payload] {
+    const auto written = outbound_.Written();
+    return !written.empty() &&
+           std::string(written.front().bytes.begin(),
+               written.front().bytes.end()) == payload;
+  }));
+  ASSERT_TRUE(PollUntil([this, flow] {
+    const auto finished = outbound_.Finished();
+    return std::find(finished.begin(), finished.end(), flow) !=
+        finished.end();
+  }));
 }
 
 TEST_F(LwipTcpTest, TeardownAbortsActiveFlows) {

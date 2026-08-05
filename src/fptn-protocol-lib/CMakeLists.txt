@@ -226,6 +226,11 @@ foreach(target "${PROJECT_NAME}_static")
     target_link_libraries(${target} mimalloc-static)
   endif()
 
+  # The INTERFACE sanitizer options propagate to the final test executables
+  # as well (Clang needs the flags at the link step). Plain signature to
+  # match the other target_link_libraries calls in this loop.
+  target_link_libraries(${target} fptn_sanitizers)
+
   # PR-LW1: absorb the lwIP objects into this archive and advertise the
   # capability to consumers (Conan mirrors the define via cpp_info).
   if (FPTN_WITH_LWIP)

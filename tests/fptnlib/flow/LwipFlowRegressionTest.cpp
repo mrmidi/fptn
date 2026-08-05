@@ -13,6 +13,7 @@
 
 #include "fptn-protocol-lib/flow/direct_tcp_outbound.h"
 #include "fptn-protocol-lib/flow/lwip_stack.h"
+#include "fptn-protocol-lib/tunnel/flow_proxy_data_plane.h"
 #include "fptn-protocol-lib/tunnel/tunnel_engine.h"
 #include "fptn-protocol-lib/tunnel/tunnel_runtime.h"
 
@@ -540,6 +541,57 @@ TEST_F(ManyConnectionsRegressionTest, CleanConnectionsReleaseAllState) {
   EXPECT_EQ(stack_->counters().active_tcp_flows.load(), 0u);
 
   server.Stop();
+}
+
+// Review case 6: a Stop() issued from the runtime thread (e.g. from a
+// native packet callback) must be rejected WITHOUT clearing started_;
+// otherwise the plane is logically stopped but physically running, and
+// every later external Stop() becomes a no-op (unrecoverable half-running
+// state). A later external Stop() must still perform full teardown.
+class FlowProxyLifecycleTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    TunnelConfiguration config;
+    config.mode = DataPlaneMode::flow_proxy;
+    config.l3.tun_ipv4 = kAppIp;
+    config.l3.tun_ipv6 = "fd00::1";
+    plane_ = std::make_unique<FlowProxyDataPlane>(
+        std::move(config), TunnelCallbacks{});
+    ASSERT_TRUE(plane_->Start().has_value());
+  }
+
+  void TearDown() override {
+    if (plane_) {
+      plane_->Stop();
+      plane_.reset();
+    }
+  }
+
+  std::unique_ptr<FlowProxyDataPlane> plane_;
+};
+
+TEST_F(FlowProxyLifecycleTest, ReentrantStopDoesNotPoisonExternalTeardown) {
+  std::promise<void> attempted;
+  auto attempted_future = attempted.get_future();
+  boost::asio::post(plane_->RuntimeExecutorForTesting(), [this, &attempted] {
+    plane_->Stop();
+    attempted.set_value();
+  });
+  ASSERT_EQ(attempted_future.wait_for(std::chrono::seconds(2)),
+      std::future_status::ready);
+
+  EXPECT_EQ(plane_->ReentrantStopAttempts(), 1u);
+  // The reentrant attempt must not pretend teardown was complete.
+  EXPECT_TRUE(plane_->IsStartedForTesting());
+
+  std::future<void> external_stop =
+      std::async(std::launch::async, [this] { plane_->Stop(); });
+  ASSERT_EQ(external_stop.wait_for(std::chrono::seconds(5)),
+      std::future_status::ready);
+
+  EXPECT_FALSE(plane_->IsStartedForTesting());
+  EXPECT_EQ(plane_->ActiveTcpFlowsForTesting(), 0u);
+  EXPECT_EQ(plane_->ActiveUdpFlowsForTesting(), 0u);
 }
 
 }  // namespace

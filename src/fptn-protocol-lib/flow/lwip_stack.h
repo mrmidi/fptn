@@ -75,6 +75,17 @@ struct PendingTcpData {
   std::uint32_t length = 0;
 };
 
+// Indirection over the raw lwIP TCP close/abort calls so tests can inject a
+// failing tcp_close() and observe the abort path without exhausting lwIP's
+// real segment pool.
+struct LwipTcpApi {
+  using CloseFunction = err_t (*)(struct tcp_pcb*);
+  using AbortFunction = void (*)(struct tcp_pcb*);
+
+  CloseFunction close = &tcp_close;
+  AbortFunction abort = &tcp_abort;
+};
+
 class LwipStack;
 
 struct LwipTcpFlow {
@@ -85,6 +96,11 @@ struct LwipTcpFlow {
   std::deque<PendingTcpData> pending_to_outbound;
   bool app_fin_received = false;
   bool outbound_finished = false;
+  // Finish() has been forwarded to the outbound. The application FIN may
+  // arrive while lwIP still retains backpressured pbufs; forwarding Finish
+  // before those bytes are admitted would let the outbound shut its send
+  // side and truncate the stream, so the flag gates MaybeFinishTcpOutbound.
+  bool outbound_finish_sent = false;
   bool closing = false;
 };
 
@@ -145,6 +161,12 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink,
     return counters_.active_tcp_flows.load(std::memory_order_relaxed);
   }
 
+  // Test-only: replace the raw lwIP close/abort calls (e.g. with a
+  // tcp_close() that fails) to exercise the abort-on-close-failure path.
+  void SetTcpApiForTesting(LwipTcpApi api) noexcept {
+    tcp_api_ = api;
+  }
+
  private:
   std::expected<void, TunnelError> StartOnExecutor();
   void StopDrain(const std::shared_ptr<std::promise<void>>& done) noexcept;
@@ -165,7 +187,14 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink,
   LwipTcpFlow* FindTcpFlow(FlowId flow) noexcept;
   void DestroyTcpFlow(FlowId flow) noexcept;
   void DrainPendingToOutbound(LwipTcpFlow& flow) noexcept;
-  void MaybeCloseFinishedFlow(LwipTcpFlow& flow) noexcept;
+  // Forwards Finish() to the outbound once the application FIN has arrived
+  // and no backpressured pbufs remain retained by lwIP.
+  void MaybeFinishTcpOutbound(LwipTcpFlow& flow) noexcept;
+  // Closes a fully-finished flow. Returns ERR_ABRT when the pcb had to be
+  // aborted (tcp_close failed) so the enclosing lwIP callback can propagate
+  // it; ERR_OK otherwise (clean close, or nothing closed yet).
+  err_t MaybeCloseFinishedFlow(LwipTcpFlow& flow) noexcept;
+  err_t CloseFinishedTcpFlow(LwipTcpFlow& flow) noexcept;
 
   static err_t OnTcpAccept(
       void* arg, struct tcp_pcb* newpcb, err_t err);
@@ -190,6 +219,7 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink,
       const ip_addr_t* addr, u16_t port);
 
   boost::asio::any_io_executor executor_;
+  LwipTcpApi tcp_api_{};
   StackConfiguration config_;
   IFlowEventSink& sink_;
   IFlowRouter& router_;

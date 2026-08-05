@@ -33,8 +33,50 @@ if(MSVC)
   add_compile_definitions(_WIN32_WINNT=0x0A00)  # Windows 10
 endif()
 
+# Sanitizer support for the host-side lwIP/flow/tunnel tests.
+# ASan+UBSan and TSan cannot be combined in one executable; configure two
+# build directories (e.g. build/asan and build/tsan).
+set(FPTN_SANITIZER "none" CACHE STRING
+    "Sanitizer: none, asan-ubsan, or tsan")
+set_property(CACHE FPTN_SANITIZER PROPERTY STRINGS none asan-ubsan tsan)
+
+if(NOT FPTN_SANITIZER STREQUAL "none")
+    # A custom allocator hides heap bugs from ASan and breaks TSan
+    # interceptors.
+    set(FPTN_WITH_MIMALLOC OFF CACHE BOOL "" FORCE)
+endif()
+
 if (FPTN_WITH_MIMALLOC)
     add_definitions(-DUSING_MIMALLOC)
+endif()
+
+add_library(fptn_sanitizers INTERFACE)
+if(NOT FPTN_SANITIZER STREQUAL "none")
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang")
+        message(FATAL_ERROR
+            "FPTN sanitizers currently require Clang or AppleClang")
+    endif()
+
+    target_compile_options(fptn_sanitizers INTERFACE
+        -O1
+        -g
+        -fno-omit-frame-pointer
+        -fno-optimize-sibling-calls)
+
+    if(FPTN_SANITIZER STREQUAL "asan-ubsan")
+        target_compile_options(fptn_sanitizers INTERFACE
+            -fsanitize=address,undefined
+            -fno-sanitize-recover=undefined)
+        target_link_options(fptn_sanitizers INTERFACE
+            -fsanitize=address,undefined)
+    elseif(FPTN_SANITIZER STREQUAL "tsan")
+        target_compile_options(fptn_sanitizers INTERFACE
+            -fsanitize=thread)
+        target_link_options(fptn_sanitizers INTERFACE
+            -fsanitize=thread)
+    else()
+        message(FATAL_ERROR "Unknown FPTN_SANITIZER=${FPTN_SANITIZER}")
+    endif()
 endif()
 
 # PR-LW1: optional HEV lwIP stack for the FlowProxy data plane.

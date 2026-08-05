@@ -69,6 +69,10 @@ class DirectTcpOutbound final : public ITcpOutbound {
     bool rx_eof = false;
     bool read_scheduled = false;
     bool closed = false;
+    // Complete() arrived while writes were still queued or in flight; the
+    // socket close is deferred until the write chain drains so completion
+    // never discards unwritten bytes.
+    bool complete_requested = false;
   };
 
   FlowState* Find(FlowId flow) noexcept;

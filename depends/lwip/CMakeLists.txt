@@ -43,3 +43,7 @@ target_compile_options(fptn_lwip PRIVATE -w)
 target_include_directories(fptn_lwip PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${FPTN_LWIP_SRC}/include")
+
+# Instrument the C sources too: UAF/OOB inside lwIP callbacks must be
+# attributable under ASan/TSan.
+target_link_libraries(fptn_lwip PRIVATE fptn_sanitizers)

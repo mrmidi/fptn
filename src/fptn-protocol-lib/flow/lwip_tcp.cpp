@@ -104,21 +104,42 @@ void LwipStack::DestroyTcpFlow(FlowId flow) noexcept {
   counters_.active_tcp_flows.fetch_sub(1, std::memory_order_relaxed);
 }
 
-void LwipStack::MaybeCloseFinishedFlow(LwipTcpFlow& flow) noexcept {
-  if (flow.closing || flow.pcb == nullptr) {
-    return;
-  }
-  if (!flow.app_fin_received || !flow.outbound_finished ||
+void LwipStack::MaybeFinishTcpOutbound(LwipTcpFlow& flow) noexcept {
+  // The application FIN may arrive while lwIP still retains backpressured
+  // pbufs. Forwarding Finish() now would let the outbound drain its own
+  // queue, shut its send side, and then receive the retained bytes after
+  // shutdown — truncating the stream. Defer until the retention drains.
+  if (!flow.app_fin_received || flow.outbound_finish_sent ||
       !flow.pending_to_outbound.empty()) {
     return;
   }
+  flow.outbound_finish_sent = true;
+  tcp_outbound_.Finish(flow.id);
+}
+
+err_t LwipStack::MaybeCloseFinishedFlow(LwipTcpFlow& flow) noexcept {
+  if (flow.closing || flow.pcb == nullptr) {
+    return ERR_OK;
+  }
+  if (!flow.app_fin_received || !flow.outbound_finished ||
+      !flow.pending_to_outbound.empty()) {
+    return ERR_OK;
+  }
+  return CloseFinishedTcpFlow(flow);
+}
+
+err_t LwipStack::CloseFinishedTcpFlow(LwipTcpFlow& flow) noexcept {
   flow.closing = true;
   tcp_arg(flow.pcb, nullptr);
   tcp_recv(flow.pcb, nullptr);
   tcp_sent(flow.pcb, nullptr);
   tcp_err(flow.pcb, nullptr);
-  if (tcp_close(flow.pcb) != ERR_OK) {
-    tcp_abort(flow.pcb);
+  // tcp_close() can fail with data still queued or unacknowledged; the pcb
+  // must then be aborted, and the enclosing lwIP callback must be told via
+  // ERR_ABRT that the pcb is gone.
+  const bool closed = tcp_api_.close(flow.pcb) == ERR_OK;
+  if (!closed) {
+    tcp_api_.abort(flow.pcb);
   }
   flow.pcb = nullptr;
 
@@ -131,6 +152,7 @@ void LwipStack::MaybeCloseFinishedFlow(LwipTcpFlow& flow) noexcept {
     counters_.active_tcp_flows.fetch_sub(1, std::memory_order_relaxed);
   }
   tcp_outbound_.Complete(flow_id);
+  return closed ? ERR_OK : ERR_ABRT;
 }
 
 void LwipStack::DrainPendingToOutbound(LwipTcpFlow& flow) noexcept {
@@ -152,7 +174,13 @@ void LwipStack::DrainPendingToOutbound(LwipTcpFlow& flow) noexcept {
     pbuf_free(front.pbuf);
     flow.pending_to_outbound.pop_front();
   }
-  MaybeCloseFinishedFlow(flow);
+  // The retention just emptied: an application FIN that was held back by
+  // MaybeFinishTcpOutbound can now be forwarded, and a fully-finished flow
+  // can close.
+  MaybeFinishTcpOutbound(flow);
+  // ERR_ABRT only matters inside a lwIP callback; this runs from the
+  // outbound's writable notification, so the abort result is not propagated.
+  static_cast<void>(MaybeCloseFinishedFlow(flow));
 }
 
 err_t LwipStack::OnTcpAccept(void* arg, struct tcp_pcb* newpcb, err_t err) {
@@ -202,8 +230,14 @@ err_t LwipStack::OnTcpAccept(void* arg, struct tcp_pcb* newpcb, err_t err) {
     // ResetTcp aborted the pcb: lwIP must be told it is gone.
     return ERR_ABRT;
   }
-  self->tcp_outbound_.Open(state->metadata, *self);
-  if (self->FindTcpFlow(state->id) == nullptr) {
+  // Open() can synchronously fail (outbound stopping, socket.open() error)
+  // and re-enter OnOutboundReset() -> ResetTcp(), which erases the
+  // map-owned flow object and leaves `state` dangling. Capture everything
+  // Open needs before the call; never touch `state` afterwards.
+  const FlowId flow_id = state->id;
+  const FlowMetadata metadata = state->metadata;
+  self->tcp_outbound_.Open(metadata, *self);
+  if (self->FindTcpFlow(flow_id) == nullptr) {
     // The outbound reported failure synchronously and reset the flow,
     // aborting the pcb.
     return ERR_ABRT;
@@ -231,9 +265,14 @@ err_t LwipStack::OnTcpRecv(
 
   if (p == nullptr) {
     flow->app_fin_received = true;
-    self.tcp_outbound_.Finish(flow->id);
-    self.MaybeCloseFinishedFlow(*flow);
-    return ERR_OK;
+    // Only forward Finish once lwIP no longer retains backpressured pbufs;
+    // otherwise the outbound could shut its send side before the retained
+    // bytes are admitted (truncation). MaybeFinishTcpOutbound applies the
+    // gate and is re-attempted from DrainPendingToOutbound.
+    self.MaybeFinishTcpOutbound(*flow);
+    // Propagate ERR_ABRT when the close had to abort the pcb; lwIP requires
+    // ERR_ABRT from any callback that aborts its pcb.
+    return self.MaybeCloseFinishedFlow(*flow);
   }
 
   const PbufBufferSequence sequence(p);
