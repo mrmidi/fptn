@@ -399,8 +399,12 @@ err_t FailTcpClose(struct tcp_pcb*) {
   return ERR_MEM;
 }
 
-void RecordTcpAbort(struct tcp_pcb*) {
+void RecordTcpAbort(struct tcp_pcb* pcb) {
   g_tcp_abort_calls.fetch_add(1, std::memory_order_relaxed);
+  // Run the real abort so the injected pcb actually leaves lwIP's global
+  // pcb lists; otherwise repeated in-process tests see a live pcb whose
+  // tuple matches the fixture and whose timers keep firing.
+  tcp_abort(pcb);
 }
 
 }  // namespace
