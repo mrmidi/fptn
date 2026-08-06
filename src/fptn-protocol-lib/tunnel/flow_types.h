@@ -66,12 +66,15 @@ struct BufferView {
 using BufferSequence = std::span<const BufferView>;
 using OwnedBuffer = std::vector<std::uint8_t>;
 
+#ifndef FPTN_OWNED_PACKET_DEFINED
+#define FPTN_OWNED_PACKET_DEFINED
 struct OwnedPacket {
   OwnedBuffer data;
   std::uint8_t ip_version = 0;
 };
 
 using OwnedPacketBatch = std::vector<OwnedPacket>;
+#endif
 using PacketOutputCallback = std::function<void(OwnedPacketBatch)>;
 
 }  // namespace fptn::tunnel

@@ -31,6 +31,9 @@ class TunnelEngine final {
   std::expected<void, TunnelError> Start();
   void Stop() noexcept;
 
+  // PacketLease batch ownership contract (see packet_types.h): on
+  // `accepted` the engine owns every lease and releases each exactly once;
+  // on any other result the caller still owns every lease.
   PacketInputResult InputPackets(PacketBatchView packets) noexcept;
 
   DataPlaneMode mode() const noexcept { return mode_; }

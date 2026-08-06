@@ -330,6 +330,83 @@ void WebsocketClient::releaseQueuedReservation(std::uint64_t packet_size) noexce
   queued_bytes_.fetch_sub(packet_size, std::memory_order_relaxed);
 }
 
+void WebsocketClient::releaseQueuedBatchReservation(
+    std::uint64_t packets, std::uint64_t bytes) noexcept {
+  queued_packets_.fetch_sub(packets, std::memory_order_relaxed);
+  queued_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
+}
+
+BatchQueueReservation::~BatchQueueReservation() {
+  if (client_ != nullptr && remaining_packets_ > 0) {
+    client_->releaseQueuedBatchReservation(
+        remaining_packets_, remaining_bytes_);
+  }
+}
+
+void BatchQueueReservation::ForgetPacket(std::uint64_t packet_size) noexcept {
+  if (remaining_packets_ > 0) {
+    --remaining_packets_;
+    remaining_bytes_ -= packet_size;
+  }
+}
+
+void BatchQueueReservation::Commit() noexcept {
+  client_ = nullptr;
+  remaining_packets_ = 0;
+  remaining_bytes_ = 0;
+}
+
+BatchQueueReservation WebsocketClient::TryReserveBatch(
+    std::uint64_t packet_count, std::uint64_t total_bytes) noexcept {
+  if (packet_count == 0) {
+    return {};
+  }
+  // Reserve packet slots against the queue cap.
+  auto packets = queued_packets_.load(std::memory_order_relaxed);
+  for (;;) {
+    if (packets > kMaxSizeOutQueue_ - packet_count) {
+      return {};
+    }
+    if (queued_packets_.compare_exchange_weak(packets, packets + packet_count,
+            std::memory_order_relaxed, std::memory_order_relaxed)) {
+      break;
+    }
+  }
+  // Reserve bytes against the byte cap; roll back slots on failure.
+  auto bytes = queued_bytes_.load(std::memory_order_relaxed);
+  for (;;) {
+    if (total_bytes > kMaxQueuedBytes ||
+        bytes > kMaxQueuedBytes - total_bytes) {
+      queued_packets_.fetch_sub(packet_count, std::memory_order_relaxed);
+      return {};
+    }
+    if (queued_bytes_.compare_exchange_weak(bytes, bytes + total_bytes,
+            std::memory_order_relaxed, std::memory_order_relaxed)) {
+      break;
+    }
+  }
+  updateQueuedBytesPeak(bytes + total_bytes);
+  return BatchQueueReservation(this, packet_count, total_bytes);
+}
+
+SendResult WebsocketClient::EnqueueReservedPacket(
+    IPPacketPtr packet, std::uint64_t packet_size) noexcept {
+  return enqueueReserved(std::move(packet), packet_size);
+}
+
+void WebsocketClient::NoteAdmissionCopy(std::uint64_t bytes) noexcept {
+  outbound_admission_copy_operations_.fetch_add(1, std::memory_order_relaxed);
+  outbound_admission_copy_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void WebsocketClient::NoteRejectedBeforeCopy(
+    std::uint64_t packets, std::uint64_t bytes) noexcept {
+  outbound_rejected_before_copy_packets_.fetch_add(
+      packets, std::memory_order_relaxed);
+  outbound_rejected_before_copy_bytes_.fetch_add(
+      bytes, std::memory_order_relaxed);
+}
+
 SendResult WebsocketClient::enqueueReserved(
     IPPacketPtr packet, std::uint64_t packet_size) noexcept {
   bool sent = false;

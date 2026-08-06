@@ -131,6 +131,44 @@ using OnConnectedCallback = std::function<void()>;
 using OnIPAssignedCallback =
 std::function<void(const IPv4Address& ipv4, const IPv6Address& ipv6)>;
 
+class WebsocketClient;
+
+// RAII guard over a reserved batch of outbound queue slots. The destructor
+// releases every reservation that was neither dismissed nor handed over to
+// an enqueued packet, so batch failure paths never leak queue accounting.
+class BatchQueueReservation {
+ public:
+  BatchQueueReservation() noexcept = default;
+  BatchQueueReservation(WebsocketClient* client, std::uint64_t packets,
+      std::uint64_t bytes) noexcept
+      : client_(client), remaining_packets_(packets), remaining_bytes_(bytes) {}
+  BatchQueueReservation(BatchQueueReservation&& other) noexcept
+      : client_(other.client_),
+        remaining_packets_(other.remaining_packets_),
+        remaining_bytes_(other.remaining_bytes_) {
+    other.client_ = nullptr;
+    other.remaining_packets_ = 0;
+    other.remaining_bytes_ = 0;
+  }
+  BatchQueueReservation(const BatchQueueReservation&) = delete;
+  BatchQueueReservation& operator=(const BatchQueueReservation&) = delete;
+  BatchQueueReservation& operator=(BatchQueueReservation&&) = delete;
+  ~BatchQueueReservation();
+
+  explicit operator bool() const noexcept { return client_ != nullptr; }
+
+  // Hands one packet's reservation over to the enqueue path: that packet's
+  // queue accounting is then kept or released by the transport.
+  void ForgetPacket(std::uint64_t packet_size) noexcept;
+  // The whole batch was enqueued; keep every reservation.
+  void Commit() noexcept;
+
+ private:
+  WebsocketClient* client_ = nullptr;
+  std::uint64_t remaining_packets_ = 0;
+  std::uint64_t remaining_bytes_ = 0;
+};
+
 class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
  public:
   struct Config {
@@ -179,6 +217,21 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
   // Validates and reserves bounded queue capacity before allocating/copying
   // the caller-owned bytes into native packet storage.
   SendResult TrySendPacketBytes(const std::uint8_t* bytes, std::size_t length);
+  // Atomically reserves queue capacity (packet slots and bytes) for a whole
+  // batch. Returns an empty (bool-false) reservation when either budget
+  // would be exceeded; no accounting is changed in that case.
+  BatchQueueReservation TryReserveBatch(
+      std::uint64_t packet_count, std::uint64_t total_bytes) noexcept;
+  // Enqueues one packet whose queue slot and bytes were already reserved
+  // (see TryReserveBatch). Keeps the reservation on success and releases it
+  // on failure, mirroring the single-packet admission path.
+  SendResult EnqueueReservedPacket(
+      fptn::common::network::IPPacketPtr packet,
+      std::uint64_t packet_size) noexcept;
+  // Batch admission diagnostics matching the single-packet counters.
+  void NoteAdmissionCopy(std::uint64_t bytes) noexcept;
+  void NoteRejectedBeforeCopy(
+      std::uint64_t packets, std::uint64_t bytes) noexcept;
   bool IsStarted() const;
 
   // PR1A: read-only numeric diagnostics for the wrapper layer.
@@ -221,6 +274,13 @@ class WebsocketClient : public std::enable_shared_from_this<WebsocketClient> {
   std::vector<std::uint8_t> GenerateHandshakePacket() const;
 
  private:
+  friend class BatchQueueReservation;
+
+  // Releases a whole-batch reservation that was not committed (RAII
+  // fallback path of BatchQueueReservation).
+  void releaseQueuedBatchReservation(
+      std::uint64_t packets, std::uint64_t bytes) noexcept;
+
   // PR1A: process-wide lifecycle counters. Per-client counters cannot
   // detect an old client still running after replacement; these can.
   static std::atomic<int> live_clients_;

@@ -9,8 +9,11 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 #include <exception>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <spdlog/spdlog.h>
+
+#include "common/network/ip_packet.h"
 
 #ifndef FPTN_CLIENT_DEFAULT_ADDRESS_IP6
 #define FPTN_CLIENT_DEFAULT_ADDRESS_IP6 "fd00::1"
@@ -90,25 +93,76 @@ PacketInputResult L3TunnelDataPlane::InputPackets(
   if (!client) {
     return PacketInputResult::transport_stopped;
   }
+
+  // Ownership contract: on `accepted` the engine owns every lease and
+  // releases each exactly once; on any other result the caller keeps every
+  // lease. The L3 transport always copies packet bytes into its own queue,
+  // so this is enforced by consuming leases only on the all-success path.
+
+  // 1. Validate every lease up front; reject before touching any lease.
+  std::uint64_t total_bytes = 0;
   for (const auto& lease : packets) {
     if (lease.bytes == nullptr || lease.length == 0) {
+      client->NoteRejectedBeforeCopy(packets.size(), total_bytes);
       return PacketInputResult::invalid_packet;
     }
     if (lease.ip_version != 0 && lease.ip_version != 4 &&
         lease.ip_version != 6) {
+      client->NoteRejectedBeforeCopy(packets.size(), total_bytes);
       return PacketInputResult::invalid_packet;
     }
-    PacketInputResult result = PacketInputResult::invalid_packet;
-    try {
-      result = MapSendResult(
-          client->TrySendPacketBytes(lease.bytes, lease.length));
-    } catch (...) {
-      result = PacketInputResult::invalid_packet;
+    // Header-only admission check (mirrors TrySendPacketBytes): avoid an
+    // allocation for malformed/non-IP input.
+    const std::uint8_t version = lease.bytes[0] >> 4;
+    if (lease.length < 20 ||
+        (version != 4 && (version != 6 || lease.length < 40))) {
+      client->NoteRejectedBeforeCopy(packets.size(), total_bytes);
+      return PacketInputResult::invalid_packet;
     }
-    if (result != PacketInputResult::accepted) {
-      return result;
+    total_bytes += lease.length;
+  }
+
+  // 2. Reserve the whole batch atomically.
+  auto reservation = client->TryReserveBatch(packets.size(), total_bytes);
+  if (!reservation) {
+    return PacketInputResult::queue_full;
+  }
+
+  // 3. Copy + parse every packet before enqueueing anything, so a parse
+  // failure rejects the batch without consuming any lease. The RAII
+  // reservation rolls back the queue accounting on this path.
+  std::vector<fptn::common::network::IPPacketPtr> parsed;
+  try {
+    parsed.reserve(packets.size());
+    for (const auto& lease : packets) {
+      fptn::common::network::IPPacketData storage(
+          lease.bytes, lease.bytes + lease.length);
+      auto packet = fptn::common::network::IPPacket::Parse(std::move(storage));
+      if (!packet) {
+        client->NoteRejectedBeforeCopy(packets.size(), total_bytes);
+        return PacketInputResult::invalid_packet;
+      }
+      client->NoteAdmissionCopy(lease.length);
+      parsed.push_back(std::move(packet));
+    }
+  } catch (...) {
+    return PacketInputResult::invalid_packet;
+  }
+
+  // 4. Enqueue the whole batch. A mid-batch failure leaves already-enqueued
+  // copies in the transport but consumes no lease, so the caller still owns
+  // every lease and the RAII reservation releases the un-enqueued slots.
+  for (std::size_t i = 0; i < parsed.size(); ++i) {
+    reservation.ForgetPacket(packets[i].length);
+    const auto result = client->EnqueueReservedPacket(
+        std::move(parsed[i]), packets[i].length);
+    if (result != fptn::protocol::https::SendResult::accepted) {
+      return MapSendResult(result);
     }
   }
+
+  reservation.Commit();
+  ReleasePacketBatch(packets);
   return PacketInputResult::accepted;
 }
 

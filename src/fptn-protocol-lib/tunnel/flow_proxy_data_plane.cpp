@@ -28,7 +28,7 @@ std::expected<void, TunnelError> FlowProxyDataPlane::Start() {
     // The runtime is one-shot; a stopped plane cannot be restarted.
     return std::unexpected(TunnelError::already_running);
   }
-  if (config_.l3.tun_ipv4.empty()) {
+  if (config_.flow.tun_ipv4.empty()) {
     return std::unexpected(TunnelError::invalid_configuration);
   }
   if (!runtime_.Start()) {
@@ -42,8 +42,9 @@ std::expected<void, TunnelError> FlowProxyDataPlane::Start() {
   udp_outbound_ = std::make_unique<flow::DirectUdpOutbound>(executor);
 
   flow::StackConfiguration stack_config;
-  stack_config.tun_ipv4 = config_.l3.tun_ipv4;
-  stack_config.tun_ipv6 = config_.l3.tun_ipv6;
+  stack_config.tun_ipv4 = config_.flow.tun_ipv4;
+  stack_config.tun_ipv6 = config_.flow.tun_ipv6;
+  stack_config.mtu = config_.flow.mtu;
 
   auto output = callbacks_.on_owned_packet_batch;
   auto stack = std::make_shared<flow::LwipStack>(executor,

@@ -238,7 +238,7 @@ class EngineRegressionTest : public ::testing::Test {
   void SetUp() override {
     TunnelConfiguration config;
     config.mode = DataPlaneMode::flow_proxy;
-    config.l3.tun_ipv4 = kAppIp;
+    config.flow.tun_ipv4 = kAppIp;
     config.l3.tun_ipv6 = "fd00::1";
     callbacks_.on_owned_packet_batch = [this](OwnedPacketBatch batch) {
       collector_.Append(std::move(batch));
@@ -553,7 +553,7 @@ class FlowProxyLifecycleTest : public ::testing::Test {
   void SetUp() override {
     TunnelConfiguration config;
     config.mode = DataPlaneMode::flow_proxy;
-    config.l3.tun_ipv4 = kAppIp;
+    config.flow.tun_ipv4 = kAppIp;
     config.l3.tun_ipv6 = "fd00::1";
     plane_ = std::make_unique<FlowProxyDataPlane>(
         std::move(config), TunnelCallbacks{});

@@ -20,7 +20,9 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 #include <lwip/init.h>
 #include <lwip/ip.h>
 #include <lwip/ip4_addr.h>
+#include <lwip/ip4_frag.h>
 #include <lwip/ip6_addr.h>
+#include <lwip/ip6_frag.h>
 #include <lwip/pbuf.h>
 #include <lwip/timeouts.h>
 
@@ -29,6 +31,18 @@ namespace fptn::tunnel::flow {
 namespace {
 
 constexpr std::chrono::milliseconds kTimeoutPumpInterval{125};
+
+constexpr std::size_t kIpv4MinHeaderLength = 20;
+constexpr std::size_t kIpv6FixedHeaderLength = 40;
+constexpr std::uint8_t kIpProtoIcmp = 1;
+constexpr std::uint8_t kIpProtoIpv6HopOpts = 0;
+constexpr std::uint8_t kIpProtoIpv6Routing = 43;
+constexpr std::uint8_t kIpProtoIpv6Fragment = 44;
+constexpr std::uint8_t kIpProtoIcmpV6 = 58;
+constexpr std::uint8_t kIpProtoIpv6DestOpts = 60;
+// Bound the IPv6 extension-header walk; real chains are a handful of
+// headers, and anything deeper is treated as malformed.
+constexpr int kMaxIpv6ExtensionDepth = 8;
 
 // lwip_init() is not reentrant: a second call re-registers the cyclic
 // timers while nodes from the previous run are still linked into the
@@ -251,6 +265,22 @@ void LwipStack::StopOnExecutor() noexcept {
   StopTcpFlows();
   StopUdpFlows();
 
+  // Age out process-wide IP reassembly state. Fragments always take the
+  // copy fallback, so the reass queues hold lwIP-owned pbufs (no leases),
+  // but without this they would outlive Stop for up to MAXAGE timer ticks.
+  // Expiry frees datagrams; it never delivers them, so this is safe to run
+  // during teardown.
+#if IP_REASSEMBLY
+  for (int i = 0; i < IP_REASS_MAXAGE; ++i) {
+    ip_reass_tmr();
+  }
+#endif
+#if LWIP_IPV6 && LWIP_IPV6_REASS
+  for (int i = 0; i < IPV6_REASS_MAXAGE; ++i) {
+    ip6_reass_tmr();
+  }
+#endif
+
   if (netif_added_) {
     netif_set_link_down(&netif_);
     netif_set_down(&netif_);
@@ -285,6 +315,147 @@ void LwipStack::ScheduleTimeoutPump() {
         }
         life->in_flight.fetch_sub(1, std::memory_order_acq_rel);
       });
+}
+
+bool LwipStack::RequiresWritableIngress(
+    const std::uint8_t* bytes, std::uint32_t length) noexcept {
+  // Packets that lwIP may modify in place must take the copy fallback:
+  // borrowed lease memory (e.g. immutable NSData) is not writable.
+  if (bytes == nullptr || length < kIpv4MinHeaderLength) {
+    return true;
+  }
+  const std::uint8_t version = bytes[0] >> 4;
+  if (version == 4) {
+    // ICMP echo replies are rewritten in place.
+    if (bytes[9] == kIpProtoIcmp) {
+      return true;
+    }
+    // IPv4 reassembly overwrites the fragment's IP header with an
+    // ip_reass_helper, so any fragment (MF set or nonzero offset) needs
+    // writable storage.
+    const std::uint16_t flags_fragment = static_cast<std::uint16_t>(
+        (static_cast<std::uint16_t>(bytes[6]) << 8) | bytes[7]);
+    const bool more_fragments = (flags_fragment & 0x2000U) != 0;
+    const std::uint16_t fragment_offset =
+        static_cast<std::uint16_t>(flags_fragment & 0x1FFFU);
+    return more_fragments || fragment_offset != 0;
+  }
+  if (version == 6) {
+    if (length < kIpv6FixedHeaderLength) {
+      return true;
+    }
+    std::uint8_t next_header = bytes[6];
+    std::size_t offset = kIpv6FixedHeaderLength;
+    for (int depth = 0; depth < kMaxIpv6ExtensionDepth; ++depth) {
+      if (next_header == kIpProtoIcmpV6) {
+        // Echo replies are rewritten in place.
+        return true;
+      }
+      if (next_header == kIpProtoIpv6Fragment) {
+        // IPv6 reassembly needs writable fragment storage.
+        return true;
+      }
+      if (next_header == kIpProtoIpv6HopOpts ||
+          next_header == kIpProtoIpv6Routing ||
+          next_header == kIpProtoIpv6DestOpts) {
+        if (offset + 2 > length) {
+          // Malformed chain: prefer the safe copy path.
+          return true;
+        }
+        const std::uint8_t extension_next = bytes[offset];
+        const std::size_t extension_length =
+            (static_cast<std::size_t>(bytes[offset + 1]) + 1) * 8;
+        next_header = extension_next;
+        offset += extension_length;
+        continue;
+      }
+      // TCP, UDP and any other terminal protocol: lwIP only reads.
+      return false;
+    }
+    return true;
+  }
+  return true;
+}
+
+IngressLeaseWrapper* LwipStack::AcquireIngressWrapper() noexcept {
+  if (!ingress_wrapper_free_.empty()) {
+    auto* wrapper = ingress_wrapper_free_.back();
+    ingress_wrapper_free_.pop_back();
+    return wrapper;
+  }
+  if (ingress_wrapper_storage_.size() >= kIngressWrapperPoolCapacity) {
+    return nullptr;
+  }
+  try {
+    ingress_wrapper_storage_.push_back(
+        std::make_unique<IngressLeaseWrapper>());
+  } catch (const std::bad_alloc&) {
+    return nullptr;
+  }
+  auto* wrapper = ingress_wrapper_storage_.back().get();
+  wrapper->stack = this;
+  return wrapper;
+}
+
+void LwipStack::ReturnIngressWrapper(IngressLeaseWrapper* wrapper) noexcept {
+  wrapper->lease = PacketLease{};
+  ingress_wrapper_free_.push_back(wrapper);
+}
+
+void LwipStack::FreeIngressLeasePbuf(struct pbuf* p) noexcept {
+  // `p` is the embedded pbuf of the wrapper's leading pbuf_custom member.
+  auto* wrapper = reinterpret_cast<IngressLeaseWrapper*>(p);
+  ReleasePacketLease(wrapper->lease);
+  wrapper->stack->ReturnIngressWrapper(wrapper);
+}
+
+void LwipStack::IngestLease(PacketLease lease) noexcept {
+  const auto length = lease.length;
+  if (!RequiresWritableIngress(lease.bytes, length)) {
+    IngressLeaseWrapper* wrapper = AcquireIngressWrapper();
+    if (wrapper != nullptr) {
+      wrapper->lease = lease;
+      wrapper->custom.custom_free_function = &LwipStack::FreeIngressLeasePbuf;
+      struct pbuf* p = pbuf_alloced_custom(PBUF_RAW,
+          static_cast<u16_t>(length), PBUF_REF, &wrapper->custom,
+          const_cast<std::uint8_t*>(lease.bytes),
+          static_cast<u16_t>(length));
+      if (p != nullptr) {
+        counters_.ingress_zero_copy_packets.fetch_add(
+            1, std::memory_order_relaxed);
+        counters_.ingress_zero_copy_bytes.fetch_add(
+            length, std::memory_order_relaxed);
+        if (ip_input(p, &netif_) != ERR_OK) {
+          // Frees through the custom callback, releasing the lease.
+          pbuf_free(p);
+        }
+        return;
+      }
+      // pbuf_alloced_custom rejected the buffer; recycle and fall back.
+      wrapper->lease = PacketLease{};
+      ReturnIngressWrapper(wrapper);
+    } else {
+      counters_.lease_pool_exhaustions.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  // Counted copy fallback: ICMP/ICMPv6, fragments, malformed headers,
+  // exhausted wrapper pool, or pbuf_alloced_custom rejection.
+  struct pbuf* p =
+      pbuf_alloc(PBUF_RAW, static_cast<u16_t>(length), PBUF_RAM);
+  if (p == nullptr) {
+    ReleasePacketLease(lease);
+    counters_.dropped_packets.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  std::memcpy(p->payload, lease.bytes, length);
+  counters_.ingress_copy_packets.fetch_add(1, std::memory_order_relaxed);
+  counters_.ingress_copy_bytes.fetch_add(length, std::memory_order_relaxed);
+  // The pbuf now owns the copied bytes; the original lease is released.
+  ReleasePacketLease(lease);
+  if (ip_input(p, &netif_) != ERR_OK) {
+    pbuf_free(p);
+  }
 }
 
 PacketInputResult LwipStack::InputPackets(PacketBatchView packets) noexcept {
@@ -322,45 +493,29 @@ PacketInputResult LwipStack::InputPackets(PacketBatchView packets) noexcept {
   }
 
   try {
-    auto pending = std::make_shared<std::vector<std::vector<std::uint8_t>>>();
-    pending->reserve(packets.size());
-    for (const auto& lease : packets) {
-      pending->emplace_back(lease.bytes, lease.bytes + lease.length);
-    }
+    // Ownership contract: returning `accepted` transfers every lease owner
+    // to the engine. The descriptors are copied into the posted operation;
+    // nothing may be released before post() succeeds.
+    std::vector<PacketLease> leases(packets.begin(), packets.end());
     counters_.input_packets.fetch_add(packets.size(), std::memory_order_relaxed);
     counters_.input_bytes.fetch_add(total_bytes, std::memory_order_relaxed);
-    // Staging copy (lease bytes are only guaranteed valid for this call).
-    counters_.ingress_copy_packets.fetch_add(
-        packets.size(), std::memory_order_relaxed);
-    counters_.ingress_copy_bytes.fetch_add(
-        total_bytes, std::memory_order_relaxed);
 
-    boost::asio::post(executor_, [this, pending, total_bytes] {
-      if (running_.load(std::memory_order_acquire)) {
-        for (const auto& data : *pending) {
-          struct pbuf* p = pbuf_alloc(
-              PBUF_RAW, static_cast<u16_t>(data.size()), PBUF_RAM);
-          if (p == nullptr) {
-            counters_.dropped_packets.fetch_add(1, std::memory_order_relaxed);
-            continue;
+    boost::asio::post(executor_,
+        [this, leases = std::move(leases), total_bytes]() mutable {
+          if (running_.load(std::memory_order_acquire)) {
+            for (auto& lease : leases) {
+              IngestLease(lease);
+            }
+          } else {
+            for (auto& lease : leases) {
+              ReleasePacketLease(lease);
+            }
+            counters_.dropped_packets.fetch_add(
+                leases.size(), std::memory_order_relaxed);
           }
-          std::memcpy(p->payload, data.data(), data.size());
-          // Second copy into the pbuf payload.
-          counters_.ingress_copy_packets.fetch_add(
-              1, std::memory_order_relaxed);
-          counters_.ingress_copy_bytes.fetch_add(
-              data.size(), std::memory_order_relaxed);
-          if (ip_input(p, &netif_) != ERR_OK) {
-            pbuf_free(p);
-          }
-        }
-      } else {
-        counters_.dropped_packets.fetch_add(
-            pending->size(), std::memory_order_relaxed);
-      }
-      inflight_bytes_.fetch_sub(total_bytes, std::memory_order_acq_rel);
-      pending_ingress_ops_.fetch_sub(1, std::memory_order_release);
-    });
+          inflight_bytes_.fetch_sub(total_bytes, std::memory_order_acq_rel);
+          pending_ingress_ops_.fetch_sub(1, std::memory_order_release);
+        });
   } catch (...) {
     pending_ingress_ops_.fetch_sub(1, std::memory_order_release);
     inflight_bytes_.fetch_sub(total_bytes, std::memory_order_acq_rel);

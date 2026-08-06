@@ -37,7 +37,7 @@ std::expected<std::unique_ptr<TunnelEngine>, TunnelError> TunnelEngine::Create(
     }
     case DataPlaneMode::flow_proxy: {
 #ifdef FPTN_HAS_LWIP
-      if (config.l3.tun_ipv4.empty()) {
+      if (config.flow.tun_ipv4.empty()) {
         return std::unexpected(TunnelError::invalid_configuration);
       }
       auto data_plane = std::make_unique<FlowProxyDataPlane>(

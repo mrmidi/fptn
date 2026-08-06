@@ -27,15 +27,34 @@ class LwipStackTest : public ::testing::Test {
       stack_->Stop();
       stack_.reset();
     }
+    // Every accepted lease must have been released exactly once by the
+    // stack; rejected batches are released by the test in Inject().
+    EXPECT_EQ(leases_.LiveLeases(), 0u);
+  }
+
+  template <typename Predicate>
+  bool PollUntil(Predicate predicate,
+      std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (predicate()) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return predicate();
   }
 
   PacketInputResult Inject(const std::vector<std::uint8_t>& packet,
       std::uint8_t ip_version) {
-    const PacketLease lease{packet.data(),
-        static_cast<std::uint32_t>(packet.size()), ip_version, nullptr,
-        nullptr};
+    PacketLease lease = leases_.Make(packet, ip_version);
     const PacketLease batch[] = {lease};
-    return stack_->InputPackets(batch);
+    const PacketInputResult result = stack_->InputPackets(batch);
+    if (result != PacketInputResult::accepted) {
+      // Ownership stays with the caller on any non-accepted result.
+      ReleasePacketLease(lease);
+    }
+    return result;
   }
 
   TestRuntime runtime_;
@@ -44,6 +63,7 @@ class LwipStackTest : public ::testing::Test {
   FakeTcpOutbound outbound_;
   FakeUdpOutbound udp_outbound_;
   OutputCollector collector_;
+  LeaseFactory leases_;
   std::unique_ptr<LwipStack> stack_;
 };
 
@@ -178,7 +198,7 @@ TEST_F(LwipStackTest, GarbagePacketIsDroppedWithoutOutput) {
   EXPECT_TRUE(stack_->IsRunning());
 }
 
-TEST_F(LwipStackTest, CountersTrackIngressCopies) {
+TEST_F(LwipStackTest, OrdinaryTcpIsZeroCopyIngress) {
   ASSERT_TRUE(stack_->Start().has_value());
 
   const auto syn = MakeTcpV4(
@@ -189,10 +209,112 @@ TEST_F(LwipStackTest, CountersTrackIngressCopies) {
   const auto& counters = stack_->counters();
   EXPECT_EQ(counters.input_packets.load(), 1u);
   EXPECT_EQ(counters.input_bytes.load(), syn.size());
-  // Two counted copy operations per packet: staging copy plus pbuf copy.
-  EXPECT_EQ(counters.ingress_copy_packets.load(), 2u);
-  EXPECT_EQ(counters.ingress_copy_bytes.load(), 2 * syn.size());
+  // Lease bytes are borrowed through a custom PBUF_REF pbuf: no copies.
+  EXPECT_EQ(counters.ingress_zero_copy_packets.load(), 1u);
+  EXPECT_EQ(counters.ingress_zero_copy_bytes.load(), syn.size());
+  EXPECT_EQ(counters.ingress_copy_packets.load(), 0u);
+  EXPECT_EQ(counters.ingress_copy_bytes.load(), 0u);
   EXPECT_GE(counters.output_packets.load(), 1u);
+}
+
+TEST_F(LwipStackTest, WritableClassesTakeCopyFallback) {
+  ASSERT_TRUE(stack_->Start().has_value());
+
+  // ICMP echo (v4 and v6) is answered in place, and fragments feed the
+  // reassembly paths that overwrite header storage: all must be copied.
+  const auto icmp4 = MakeIcmpV4Echo("10.8.0.2", "93.184.216.34");
+  EXPECT_EQ(Inject(icmp4, 4), PacketInputResult::accepted);
+  const auto icmp6 = MakeIcmpV6Echo("fd00::2", "2606:2800:220:1::1");
+  EXPECT_EQ(Inject(icmp6, 6), PacketInputResult::accepted);
+
+  auto frag_mf = MakeTcpV4(
+      "10.8.0.2", "93.184.216.34", 50000, 443, 1000, 0, kFlagAck);
+  MarkV4MoreFragments(frag_mf);
+  EXPECT_EQ(Inject(frag_mf, 4), PacketInputResult::accepted);
+
+  auto frag_offset = MakeTcpV4(
+      "10.8.0.2", "93.184.216.34", 50000, 443, 1000, 0, kFlagAck);
+  MarkV4FragmentOffset(frag_offset);
+  EXPECT_EQ(Inject(frag_offset, 4), PacketInputResult::accepted);
+
+  const auto frag6 =
+      MakeFragmentedTcpV6("fd00::2", "2606:2800:220:1::1", 50000, 443);
+  EXPECT_EQ(Inject(frag6, 6), PacketInputResult::accepted);
+
+  const std::uint64_t expected_bytes = icmp4.size() + icmp6.size() +
+                                       frag_mf.size() + frag_offset.size() +
+                                       frag6.size();
+  const auto& counters = stack_->counters();
+  ASSERT_TRUE(PollUntil([&] {
+    return counters.ingress_copy_packets.load(std::memory_order_relaxed) >=
+           5u;
+  }));
+  EXPECT_EQ(counters.ingress_copy_packets.load(), 5u);
+  EXPECT_EQ(counters.ingress_copy_bytes.load(), expected_bytes);
+  EXPECT_EQ(counters.ingress_zero_copy_packets.load(), 0u);
+  // Copy fallback releases each lease immediately after copying.
+  ASSERT_TRUE(PollUntil([&] { return leases_.LiveLeases() == 0u; }));
+  EXPECT_EQ(leases_.ReleasedLeases(), 5u);
+}
+
+TEST_F(LwipStackTest, LeasePoolExhaustionFallsBackToCopy) {
+  ASSERT_TRUE(stack_->Start().has_value());
+
+  // Handshake a TCP flow, then backpressure it so every data segment's
+  // borrowed pbuf stays retained. Past the bounded wrapper pool capacity
+  // the stack must fall back to a counted copy instead of failing.
+  const std::uint16_t dport = 443;
+  const auto syn = MakeTcpV4(
+      "10.8.0.2", "93.184.216.34", 50000, dport, 1000, 0, kFlagSyn);
+  EXPECT_EQ(Inject(syn, 4), PacketInputResult::accepted);
+  ASSERT_TRUE(collector_.WaitForCount(1));
+  const auto synack = collector_.Snapshot().front();
+  const std::uint32_t server_seq = ReadSeq(synack.data, 20) + 1;
+  const auto ack = MakeTcpV4("10.8.0.2", "93.184.216.34", 50000, dport,
+      1001, server_seq, kFlagAck);
+  EXPECT_EQ(Inject(ack, 4), PacketInputResult::accepted);
+
+  outbound_.SetRejectWrites(true);
+  const std::vector<std::uint8_t> payload(16, 0x5A);
+  std::uint32_t client_seq = 1001;
+  const std::size_t total_segments = LwipStack::kIngressWrapperPoolCapacity + 8;
+  for (std::size_t i = 0; i < total_segments; ++i) {
+    const auto segment = MakeTcpV4("10.8.0.2", "93.184.216.34", 50000,
+        dport, client_seq, server_seq, kFlagAck, payload);
+    client_seq += static_cast<std::uint32_t>(payload.size());
+    ASSERT_EQ(Inject(segment, 4), PacketInputResult::accepted);
+  }
+
+  const auto& counters = stack_->counters();
+  ASSERT_TRUE(PollUntil([&] {
+    return counters.lease_pool_exhaustions.load(std::memory_order_relaxed) >=
+           1u;
+  }));
+  EXPECT_GE(counters.ingress_copy_packets.load(), 1u);
+  // Retained zero-copy leases stay live until teardown frees the pbufs.
+  EXPECT_GT(leases_.LiveLeases(), 0u);
+
+  // Stop must release every retained lease.
+  stack_->Stop();
+  EXPECT_EQ(leases_.LiveLeases(), 0u);
+}
+
+TEST_F(LwipStackTest, StopAfterAcceptedBatchReleasesLeases) {
+  ASSERT_TRUE(stack_->Start().has_value());
+
+  // Accept a batch, then stop before asserting anything else: the posted
+  // ingress handler either ingests (and teardown frees) or drops and
+  // releases. Either way every lease must be gone after Stop returns.
+  for (std::uint16_t port = 50000; port < 50010; ++port) {
+    const auto syn = MakeTcpV4(
+        "10.8.0.2", "93.184.216.34", port, 443, 1000, 0, kFlagSyn);
+    EXPECT_EQ(Inject(syn, 4), PacketInputResult::accepted);
+  }
+  stack_->Stop();
+  EXPECT_EQ(leases_.LiveLeases(), 0u);
+  EXPECT_EQ(leases_.ReleasedLeases(), 10u);
+  // Re-arm so TearDown's second Stop() stays a no-op.
+  stack_.reset();
 }
 
 }  // namespace

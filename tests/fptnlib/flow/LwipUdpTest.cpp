@@ -103,7 +103,7 @@ class LwipUdpEngineTest : public ::testing::Test {
   void SetUp() override {
     TunnelConfiguration config;
     config.mode = DataPlaneMode::flow_proxy;
-    config.l3.tun_ipv4 = kAppIp;
+    config.flow.tun_ipv4 = kAppIp;
     config.l3.tun_ipv6 = "fd00::1";
     callbacks_.on_owned_packet_batch = [this](OwnedPacketBatch batch) {
       collector_.Append(std::move(batch));
@@ -230,7 +230,7 @@ TEST_F(LwipUdpEngineTest, StopRejectsFurtherInput) {
   auto config_result = [&] {
     TunnelConfiguration config;
     config.mode = DataPlaneMode::flow_proxy;
-    config.l3.tun_ipv4 = kAppIp;
+    config.flow.tun_ipv4 = kAppIp;
     return TunnelEngine::Create(config, callbacks_);
   }();
   ASSERT_TRUE(config_result.has_value());

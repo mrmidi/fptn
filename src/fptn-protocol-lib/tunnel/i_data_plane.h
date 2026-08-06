@@ -20,6 +20,9 @@ class IDataPlane {
   virtual std::expected<void, TunnelError> Start() = 0;
   virtual void Stop() noexcept = 0;
 
+  // PacketLease batch ownership contract (see packet_types.h): on
+  // `accepted` the plane owns every lease and releases each exactly once;
+  // on any other result the caller still owns every lease.
   virtual PacketInputResult InputPackets(PacketBatchView packets) noexcept = 0;
 };
 

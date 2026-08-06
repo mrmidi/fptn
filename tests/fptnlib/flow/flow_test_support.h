@@ -4,6 +4,7 @@
 
 #include <arpa/inet.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -140,6 +141,45 @@ inline std::vector<std::uint8_t> MakeTcpV6(const char* src, const char* dst,
   WriteU16(packet, 56, Checksum(tcp, tcp_length, pseudo));
   return packet;
 }
+
+// Heap-owned lease bytes with release tracking. The engine owns accepted
+// leases and must release each exactly once; tests assert LiveLeases()
+// returns to zero and ReleasedLeases() matches the accepted count.
+class LeaseFactory final {
+ public:
+  PacketLease Make(std::vector<std::uint8_t> data,
+      std::uint8_t ip_version = 4) {
+    auto* slot = new LeaseSlot{this, std::move(data)};
+    live_.fetch_add(1, std::memory_order_acq_rel);
+    return PacketLease{slot->data.data(),
+        static_cast<std::uint32_t>(slot->data.size()), ip_version, slot,
+        &LeaseFactory::ReleaseSlot};
+  }
+
+  std::size_t LiveLeases() const noexcept {
+    return live_.load(std::memory_order_acquire);
+  }
+
+  std::uint64_t ReleasedLeases() const noexcept {
+    return released_.load(std::memory_order_acquire);
+  }
+
+ private:
+  struct LeaseSlot {
+    LeaseFactory* factory;
+    std::vector<std::uint8_t> data;
+  };
+
+  static void ReleaseSlot(void* owner) noexcept {
+    auto* slot = static_cast<LeaseSlot*>(owner);
+    slot->factory->released_.fetch_add(1, std::memory_order_acq_rel);
+    slot->factory->live_.fetch_sub(1, std::memory_order_acq_rel);
+    delete slot;
+  }
+
+  std::atomic<std::size_t> live_{0};
+  std::atomic<std::uint64_t> released_{0};
+};
 
 class TestRuntime final {
  public:
@@ -309,6 +349,112 @@ inline std::vector<std::uint8_t> MakeUdpV6(const char* src, const char* dst,
   pseudo += static_cast<std::uint32_t>(udp_length);
   pseudo += 17;
   WriteU16(packet, 46, Checksum(udp, udp_length, pseudo));
+  return packet;
+}
+
+// IPv4 ICMP echo request: lwIP answers echo in place, so the stack must
+// never borrow these bytes zero-copy.
+inline std::vector<std::uint8_t> MakeIcmpV4Echo(
+    const char* src, const char* dst) {
+  const std::size_t icmp_length = 8 + 4;
+  const std::size_t total = 20 + icmp_length;
+  std::vector<std::uint8_t> packet(total, 0);
+
+  packet[0] = 0x45;
+  WriteU16(packet, 2, static_cast<std::uint16_t>(total));
+  packet[8] = 64;
+  packet[9] = 1;
+  const std::uint32_t src_addr = ParseV4(src);
+  const std::uint32_t dst_addr = ParseV4(dst);
+  std::memcpy(packet.data() + 12, &src_addr, 4);
+  std::memcpy(packet.data() + 16, &dst_addr, 4);
+  WriteU16(packet, 10, Checksum(packet.data(), 20));
+
+  std::uint8_t* icmp = packet.data() + 20;
+  icmp[0] = 8;  // echo request
+  icmp[1] = 0;
+  WriteU16(packet, 24, 0x1234);
+  WriteU16(packet, 26, 1);
+  WriteU16(packet, 22, Checksum(icmp, icmp_length));
+  return packet;
+}
+
+// IPv6 ICMPv6 echo request (next header 58).
+inline std::vector<std::uint8_t> MakeIcmpV6Echo(
+    const char* src, const char* dst) {
+  const std::size_t icmp_length = 8 + 4;
+  const std::size_t total = 40 + icmp_length;
+  std::vector<std::uint8_t> packet(total, 0);
+
+  packet[0] = 0x60;
+  WriteU16(packet, 4, static_cast<std::uint16_t>(icmp_length));
+  packet[6] = 58;
+  packet[7] = 64;
+  in6_addr src6;
+  in6_addr dst6;
+  EXPECT_EQ(1, inet_pton(AF_INET6, src, &src6));
+  EXPECT_EQ(1, inet_pton(AF_INET6, dst, &dst6));
+  std::memcpy(packet.data() + 8, &src6, 16);
+  std::memcpy(packet.data() + 24, &dst6, 16);
+
+  std::uint8_t* icmp = packet.data() + 40;
+  icmp[0] = 128;  // echo request
+  icmp[1] = 0;
+  WriteU16(packet, 44, 0x1234);
+  WriteU16(packet, 46, 1);
+  std::uint32_t pseudo = Sum16Folded(packet.data() + 8, 32);
+  pseudo += static_cast<std::uint32_t>(icmp_length);
+  pseudo += 58;
+  WriteU16(packet, 42, Checksum(icmp, icmp_length, pseudo));
+  return packet;
+}
+
+// Sets MF on an IPv4 packet, marking it a fragment that reassembly must be
+// able to overwrite.
+inline void MarkV4MoreFragments(std::vector<std::uint8_t>& packet) {
+  packet[6] = static_cast<std::uint8_t>(packet[6] | 0x20u);
+}
+
+// Sets a nonzero IPv4 fragment offset (first fragment already seen).
+inline void MarkV4FragmentOffset(std::vector<std::uint8_t>& packet) {
+  packet[6] = static_cast<std::uint8_t>(packet[6] & 0xE0u) | 0x01u;
+  packet[7] = 0x68u;
+}
+
+// IPv6 packet carrying a Fragment extension header (next header 44) before
+// a TCP header: the v6 reassembly path needs writable storage.
+inline std::vector<std::uint8_t> MakeFragmentedTcpV6(
+    const char* src, const char* dst, std::uint16_t sport,
+    std::uint16_t dport) {
+  const std::size_t frag_header_length = 8;
+  const std::size_t tcp_length = 20;
+  const std::size_t total = 40 + frag_header_length + tcp_length;
+  std::vector<std::uint8_t> packet(total, 0);
+
+  packet[0] = 0x60;
+  WriteU16(packet, 4,
+      static_cast<std::uint16_t>(frag_header_length + tcp_length));
+  packet[6] = 44;  // Fragment extension header
+  packet[7] = 64;
+  in6_addr src6;
+  in6_addr dst6;
+  EXPECT_EQ(1, inet_pton(AF_INET6, src, &src6));
+  EXPECT_EQ(1, inet_pton(AF_INET6, dst, &dst6));
+  std::memcpy(packet.data() + 8, &src6, 16);
+  std::memcpy(packet.data() + 24, &dst6, 16);
+
+  // Fragment header: next header TCP, MF set, nonzero identification.
+  packet[40] = 6;
+  packet[41] = 0;
+  packet[42] = 0x00;
+  packet[43] = 0x01;
+  WriteU32(packet, 44, 0xDEADBEEF);
+
+  std::uint8_t* tcp = packet.data() + 48;
+  WriteU16(packet, 48, sport);
+  WriteU16(packet, 50, dport);
+  tcp[12] = 0x50;
+  tcp[13] = kFlagSyn;
   return packet;
 }
 

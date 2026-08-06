@@ -31,6 +31,12 @@ struct TunnelL3Configuration {
   int concurrency_hint = 1;
 };
 
+struct TunnelFlowConfiguration {
+  std::string tun_ipv4;
+  std::string tun_ipv6;
+  std::uint16_t mtu = 1400;
+};
+
 struct TunnelCallbacks {
   using PacketBatchCallback =
       std::function<void(fptn::common::network::BatchIPPacketPtr)>;
@@ -48,6 +54,7 @@ struct TunnelCallbacks {
 struct TunnelConfiguration {
   DataPlaneMode mode = DataPlaneMode::l3_tunnel;
   TunnelL3Configuration l3;
+  TunnelFlowConfiguration flow;
 };
 
 }  // namespace fptn::tunnel

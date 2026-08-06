@@ -54,6 +54,8 @@ class LwipTcpTest : public ::testing::Test {
       stack_->Stop();
       stack_.reset();
     }
+    // Every accepted lease must have been released exactly once.
+    EXPECT_EQ(leases_.LiveLeases(), 0u);
   }
 
   // Runs fn on the stack executor thread and blocks until it completes.

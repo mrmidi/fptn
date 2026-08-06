@@ -58,6 +58,13 @@ struct StackCounters {
   std::atomic<std::uint64_t> output_bytes{0};
   std::atomic<std::uint64_t> ingress_copy_packets{0};
   std::atomic<std::uint64_t> ingress_copy_bytes{0};
+  // Zero-copy ingress: lease bytes borrowed through a custom PBUF_REF pbuf
+  // without any payload copy (the normal TCP/UDP path).
+  std::atomic<std::uint64_t> ingress_zero_copy_packets{0};
+  std::atomic<std::uint64_t> ingress_zero_copy_bytes{0};
+  // The bounded lease-wrapper pool was full; the packet fell back to a
+  // counted PBUF_RAM copy.
+  std::atomic<std::uint64_t> lease_pool_exhaustions{0};
   std::atomic<std::uint64_t> egress_coalesce_packets{0};
   std::atomic<std::uint64_t> egress_coalesce_bytes{0};
   std::atomic<std::uint64_t> dropped_packets{0};
@@ -110,6 +117,19 @@ struct LwipUdpFlow {
   struct udp_pcb* pcb = nullptr;
   FlowMetadata metadata;
   std::chrono::steady_clock::time_point last_activity;
+};
+
+class LwipStack;
+
+// Pooled zero-copy wrapper binding a borrowed ingress lease to a custom
+// pbuf. Must keep `custom` as the first member: lwIP passes the embedded
+// `struct pbuf*` to the free callback, which recovers the wrapper from it.
+// The free callback releases the lease exactly once and returns the
+// wrapper to the stack's strand-local pool.
+struct IngressLeaseWrapper {
+  struct pbuf_custom custom;
+  PacketLease lease{};
+  LwipStack* stack = nullptr;
 };
 
 class LwipStack final : public INetworkStack, public ITcpOutboundSink,
@@ -167,6 +187,11 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink,
     tcp_api_ = api;
   }
 
+  // Bounded strand-local pool of zero-copy ingress wrappers. Allocation and
+  // return both happen on the executor thread, so no locking is needed.
+  // Exhaustion falls back to a counted PBUF_RAM copy.
+  static constexpr std::size_t kIngressWrapperPoolCapacity = 512;
+
  private:
   std::expected<void, TunnelError> StartOnExecutor();
   void StopDrain(const std::shared_ptr<std::promise<void>>& done) noexcept;
@@ -174,6 +199,20 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink,
   bool OnExecutorThread() const noexcept;
   void PumpTimeouts(const boost::system::error_code& ec);
   void ScheduleTimeoutPump();
+
+  // Zero-copy ingress (executor thread only). RequiresWritableIngress
+  // returns true when lwIP may write into the packet in place (ICMP echo,
+  // reassembled fragments, malformed headers), forcing the counted
+  // PBUF_RAM copy fallback. IngestLease consumes one engine-owned lease:
+  // it either borrows the bytes through a pooled custom PBUF_REF pbuf
+  // (release happens in the pbuf free callback) or copies into PBUF_RAM
+  // and releases the lease immediately.
+  static bool RequiresWritableIngress(
+      const std::uint8_t* bytes, std::uint32_t length) noexcept;
+  void IngestLease(PacketLease lease) noexcept;
+  IngressLeaseWrapper* AcquireIngressWrapper() noexcept;
+  void ReturnIngressWrapper(IngressLeaseWrapper* wrapper) noexcept;
+  static void FreeIngressLeasePbuf(struct pbuf* p) noexcept;
 
   static err_t NetifInit(struct netif* netif);
   static err_t OutputV4(
@@ -253,6 +292,9 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink,
   std::vector<struct udp_pcb*> rejected_udp_pcbs_;
   boost::asio::steady_timer udp_expiry_timer_;
   bool udp_expiry_scheduled_{false};
+
+  std::vector<std::unique_ptr<IngressLeaseWrapper>> ingress_wrapper_storage_;
+  std::vector<IngressLeaseWrapper*> ingress_wrapper_free_;
 
   std::shared_ptr<StackLifeToken> life_ = std::make_shared<StackLifeToken>();
 };

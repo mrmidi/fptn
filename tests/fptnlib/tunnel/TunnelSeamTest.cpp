@@ -28,6 +28,8 @@ TunnelConfiguration MakeL3Configuration() {
   config.l3.server_port = 1;
   config.l3.tun_ipv4 = "10.8.0.2";
   config.l3.tun_ipv6 = "fd00::1";
+  config.flow.tun_ipv4 = "10.8.0.2";
+  config.flow.tun_ipv6 = "fd00::1";
   config.l3.sni = "seam.test.example";
   config.l3.access_token = "test-token";
   config.l3.concurrency_hint = 1;
