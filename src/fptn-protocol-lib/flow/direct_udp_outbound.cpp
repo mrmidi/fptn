@@ -12,7 +12,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 namespace fptn::tunnel::flow {
 
 DirectUdpOutbound::DirectUdpOutbound(boost::asio::any_io_executor executor)
-    : executor_(std::move(executor)) {}
+    : executor_(std::move(executor)), rx_scratch_(kReadBufferSize) {}
 
 DirectUdpOutbound::~DirectUdpOutbound() { Stop(); }
 
@@ -40,7 +40,6 @@ void DirectUdpOutbound::Open(FlowMetadata metadata, IUdpOutboundSink& sink) {
   auto state = std::make_unique<FlowState>(executor_);
   state->id = metadata.id;
   state->sink = &sink;
-  state->rx_buffer.resize(kReadBufferSize);
 
   boost::system::error_code ec;
   const auto protocol = metadata.destination.address.is_v4()
@@ -56,6 +55,16 @@ void DirectUdpOutbound::Open(FlowMetadata metadata, IUdpOutboundSink& sink) {
       metadata.destination.address, metadata.destination.port};
   state->socket.connect(endpoint, ec);
   if (ec) {
+    boost::system::error_code close_ec;
+    state->socket.close(close_ec);
+    report_failure(FlowError::outbound_failure);
+    return;
+  }
+  // The read after async_wait is synchronous; non-blocking guarantees it can
+  // never stall the executor thread on a spurious readability signal.
+  boost::system::error_code mode_ec;
+  state->socket.non_blocking(true, mode_ec);
+  if (mode_ec) {
     boost::system::error_code close_ec;
     state->socket.close(close_ec);
     report_failure(FlowError::outbound_failure);
@@ -121,20 +130,23 @@ void DirectUdpOutbound::OnSendDone(
   }
 }
 
+// Waits for readability rather than posting a buffered read: async_wait holds
+// no buffer, so the shared rx_scratch_ is only ever touched by the synchronous
+// receive below, on the executor thread.
 void DirectUdpOutbound::StartReceive(FlowState& state) {
   if (state.receive_scheduled || state.closed || stopping_) {
     return;
   }
   state.receive_scheduled = true;
   const FlowId flow = state.id;
-  state.socket.async_receive(boost::asio::buffer(state.rx_buffer),
-      [this, flow](const boost::system::error_code& ec, std::size_t length) {
-        OnReceive(flow, ec, length);
+  state.socket.async_wait(boost::asio::ip::udp::socket::wait_read,
+      [this, flow](const boost::system::error_code& ec) {
+        OnReadable(flow, ec);
       });
 }
 
-void DirectUdpOutbound::OnReceive(FlowId flow,
-    const boost::system::error_code& ec, std::size_t length) {
+void DirectUdpOutbound::OnReadable(
+    FlowId flow, const boost::system::error_code& ec) {
   FlowState* state = Find(flow);
   if (state == nullptr) {
     return;
@@ -146,9 +158,25 @@ void DirectUdpOutbound::OnReceive(FlowId flow,
     sink->OnUdpReset(flow, FlowError::outbound_failure);
     return;
   }
+
+  boost::system::error_code read_ec;
+  const std::size_t length =
+      state->socket.receive(boost::asio::buffer(rx_scratch_), 0, read_ec);
+  if (read_ec == boost::asio::error::would_block ||
+      read_ec == boost::asio::error::try_again) {
+    // Spurious readability; wait again rather than dropping the flow.
+    StartReceive(*state);
+    return;
+  }
+  if (read_ec) {
+    IUdpOutboundSink* sink = state->sink;
+    CloseFlow(flow);
+    sink->OnUdpReset(flow, FlowError::outbound_failure);
+    return;
+  }
   if (length > 0) {
     OwnedBuffer payload(
-        state->rx_buffer.data(), state->rx_buffer.data() + length);
+        rx_scratch_.data(), rx_scratch_.data() + length);
     state->sink->OnUdpDatagramReceived(flow, std::move(payload));
   }
   FlowState* after = Find(flow);

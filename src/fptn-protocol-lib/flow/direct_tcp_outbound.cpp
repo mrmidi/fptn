@@ -15,7 +15,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 namespace fptn::tunnel::flow {
 
 DirectTcpOutbound::DirectTcpOutbound(boost::asio::any_io_executor executor)
-    : executor_(std::move(executor)) {}
+    : executor_(std::move(executor)), rx_scratch_(kReadBufferSize) {}
 
 DirectTcpOutbound::~DirectTcpOutbound() { Stop(); }
 
@@ -69,6 +69,10 @@ void DirectTcpOutbound::OnConnect(
     return;
   }
   state->connected = true;
+  // The read after async_wait is synchronous; non-blocking guarantees it can
+  // never stall the executor thread on a spurious readability signal.
+  boost::system::error_code mode_ec;
+  state->socket.non_blocking(true, mode_ec);
   state->sink->OnOutboundConnected(flow);
   if (Find(flow) == nullptr) {
     return;
@@ -179,32 +183,29 @@ void DirectTcpOutbound::MaybeShutdownSend(FlowState& state) {
   state.tx_shutdown_done = true;
 }
 
+// Waits for readability instead of posting a buffered read, so no buffer is
+// pinned per flow while the socket is idle; the read below fills the shared
+// scratch synchronously on the executor thread.
 void DirectTcpOutbound::StartRead(FlowState& state) {
   if (state.read_scheduled || state.rx_eof || state.closed || stopping_) {
     return;
   }
   state.read_scheduled = true;
   const FlowId flow = state.id;
-  state.socket.async_read_some(
-      boost::asio::buffer(state.rx_buffer),
-      [this, flow](const boost::system::error_code& ec, std::size_t length) {
-        OnRead(flow, ec, length);
+  state.socket.async_wait(boost::asio::ip::tcp::socket::wait_read,
+      [this, flow](const boost::system::error_code& ec) {
+        OnReadable(flow, ec);
       });
 }
 
-void DirectTcpOutbound::OnRead(FlowId flow,
-    const boost::system::error_code& ec, std::size_t length) {
+void DirectTcpOutbound::OnReadable(
+    FlowId flow, const boost::system::error_code& ec) {
   FlowState* state = Find(flow);
   if (state == nullptr) {
     return;
   }
   state->read_scheduled = false;
 
-  if (ec == boost::asio::error::eof) {
-    state->rx_eof = true;
-    state->sink->OnOutboundFinished(flow);
-    return;
-  }
   if (ec) {
     ITcpOutboundSink* sink = state->sink;
     CloseFlow(flow);
@@ -212,8 +213,29 @@ void DirectTcpOutbound::OnRead(FlowId flow,
     return;
   }
 
+  boost::system::error_code read_ec;
+  const std::size_t length =
+      state->socket.read_some(boost::asio::buffer(rx_scratch_), read_ec);
+  if (read_ec == boost::asio::error::would_block ||
+      read_ec == boost::asio::error::try_again) {
+    // Spurious readability; wait again rather than tearing the flow down.
+    StartRead(*state);
+    return;
+  }
+  if (read_ec == boost::asio::error::eof) {
+    state->rx_eof = true;
+    state->sink->OnOutboundFinished(flow);
+    return;
+  }
+  if (read_ec) {
+    ITcpOutboundSink* sink = state->sink;
+    CloseFlow(flow);
+    sink->OnOutboundReset(flow, FlowError::outbound_failure);
+    return;
+  }
+
   state->held_read.assign(
-      state->rx_buffer.data(), state->rx_buffer.data() + length);
+      rx_scratch_.data(), rx_scratch_.data() + length);
   if (DeliverHeldRead(*state)) {
     StartRead(*state);
   }

@@ -61,7 +61,6 @@ class DirectTcpOutbound final : public ITcpOutbound {
     std::deque<std::vector<std::uint8_t>> pending_writes;
     std::size_t queued_bytes = 0;
     std::vector<std::uint8_t> held_read;
-    std::array<std::uint8_t, kReadBufferSize> rx_buffer{};
     bool connected = false;
     bool writing = false;
     bool tx_shutdown_requested = false;
@@ -81,13 +80,17 @@ class DirectTcpOutbound final : public ITcpOutbound {
   void OnWriteDone(FlowId flow, const boost::system::error_code& ec);
   static void MaybeShutdownSend(FlowState& state);
   void StartRead(FlowState& state);
-  void OnRead(FlowId flow, const boost::system::error_code& ec,
-      std::size_t length);
+  void OnReadable(FlowId flow, const boost::system::error_code& ec);
   static bool DeliverHeldRead(FlowState& state);
   void CloseFlow(FlowId flow) noexcept;
 
   boost::asio::any_io_executor executor_;
   std::unordered_map<FlowId, std::unique_ptr<FlowState>> flows_;
+  // Shared rather than per-flow: async_wait holds no buffer, and the read that
+  // fills this runs synchronously on the single executor thread, so only one
+  // flow can own it at a time. Previously kReadBufferSize sat inside every
+  // FlowState, making footprint scale with concurrent flows.
+  std::vector<std::uint8_t> rx_scratch_;
   std::atomic<std::uint64_t> active_flows_{0};
   std::atomic<std::uint64_t> opened_total_{0};
   bool stopping_ = false;
