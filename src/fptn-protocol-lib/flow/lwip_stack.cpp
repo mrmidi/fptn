@@ -32,6 +32,11 @@ namespace {
 
 constexpr std::chrono::milliseconds kTimeoutPumpInterval{125};
 
+// Egress batch bounds, mirroring the L3 transport's inbound batching so both
+// data planes hand the platform comparably sized writes.
+constexpr std::size_t kMaxEgressBatchPackets = 32;
+constexpr std::size_t kMaxEgressBatchBytes = 64 * 1024;
+
 constexpr std::size_t kIpv4MinHeaderLength = 20;
 constexpr std::size_t kIpv6FixedHeaderLength = 40;
 constexpr std::uint8_t kIpProtoIcmp = 1;
@@ -264,6 +269,11 @@ void LwipStack::StopOnExecutor() noexcept {
 
   StopTcpFlows();
   StopUdpFlows();
+
+  // Deliver whatever the flow teardown just emitted (FIN/RST) plus anything
+  // still pending, before the netif goes away. A deferred flush may also be
+  // in the queue; FlushEgress is idempotent once the batch is empty.
+  FlushEgress();
 
   // Age out process-wide IP reassembly state. Fragments always take the
   // copy fallback, so the reass queues hold lwIP-owned pbufs (no leases),
@@ -553,24 +563,94 @@ err_t LwipStack::OutputPacket(struct pbuf* p, std::uint8_t ip_version) {
   if (p == nullptr || p->tot_len == 0) {
     return ERR_OK;
   }
-  OwnedPacket packet;
-  packet.ip_version = ip_version;
-  packet.data.resize(p->tot_len);
-  pbuf_copy_partial(p, packet.data.data(), p->tot_len, 0);
+  if (!output_) {
+    return ERR_OK;
+  }
+
+  // Reuse the slot from the previous batch; only the first few batches after
+  // startup allocate. Filling with assign() rather than resize() matters: on
+  // a vector whose size is below tot_len, resize() value-initialises the new
+  // bytes and pbuf_copy_partial then overwrites every one of them, which
+  // profiled as the single largest cost in the stack.
+  if (egress_count_ == egress_slots_.size()) {
+    egress_slots_.emplace_back();
+  }
+  OwnedPacket& slot = egress_slots_[egress_count_];
+  slot.ip_version = ip_version;
+  if (p->next == nullptr) {
+    const auto* src = static_cast<const std::uint8_t*>(p->payload);
+    slot.data.assign(src, src + p->tot_len);
+  } else {
+    // Chained pbuf: no contiguous source, so fall back to a gathered copy.
+    slot.data.resize(p->tot_len);
+    pbuf_copy_partial(p, slot.data.data(), p->tot_len, 0);
+  }
+  ++egress_count_;
 
   counters_.output_packets.fetch_add(1, std::memory_order_relaxed);
-  counters_.output_bytes.fetch_add(packet.data.size(),
-      std::memory_order_relaxed);
-  counters_.egress_coalesce_packets.fetch_add(1, std::memory_order_relaxed);
-  counters_.egress_coalesce_bytes.fetch_add(packet.data.size(),
-      std::memory_order_relaxed);
+  counters_.output_bytes.fetch_add(p->tot_len, std::memory_order_relaxed);
+  pending_egress_bytes_ += p->tot_len;
 
-  if (output_) {
-    OwnedPacketBatch batch;
-    batch.push_back(std::move(packet));
-    output_(std::move(batch));
+  if (egress_count_ >= kMaxEgressBatchPackets ||
+      pending_egress_bytes_ >= kMaxEgressBatchBytes) {
+    FlushEgress();
+    return ERR_OK;
   }
+  ScheduleEgressFlush();
   return ERR_OK;
+}
+
+// Flushing on the 125 ms timeout pump would add that much latency to every
+// interactive packet, so the deferred flush runs at the end of the current
+// executor turn instead: it coalesces exactly the burst lwIP emits while
+// processing one ingress batch or one outbound socket read, and costs
+// microseconds rather than a timer period.
+void LwipStack::ScheduleEgressFlush() noexcept {
+  if (egress_flush_scheduled_) {
+    return;
+  }
+  std::weak_ptr<StackLifeToken> weak_life = life_;
+  try {
+    boost::asio::post(executor_, [this, weak_life] {
+      auto life = weak_life.lock();
+      if (!life) {
+        return;
+      }
+      life->in_flight.fetch_add(1, std::memory_order_acq_rel);
+      if (life->alive.load(std::memory_order_acquire)) {
+        FlushEgress();
+      }
+      life->in_flight.fetch_sub(1, std::memory_order_acq_rel);
+    });
+  } catch (...) {
+    // Cannot defer; deliver synchronously rather than stranding the packets.
+    FlushEgress();
+    return;
+  }
+  egress_flush_scheduled_ = true;
+}
+
+void LwipStack::FlushEgress() noexcept {
+  egress_flush_scheduled_ = false;
+  if (egress_count_ == 0 || !output_) {
+    egress_count_ = 0;
+    pending_egress_bytes_ = 0;
+    return;
+  }
+  counters_.egress_coalesce_packets.fetch_add(
+      egress_count_, std::memory_order_relaxed);
+  counters_.egress_coalesce_bytes.fetch_add(
+      pending_egress_bytes_, std::memory_order_relaxed);
+  counters_.egress_batches.fetch_add(1, std::memory_order_relaxed);
+
+  // The slots stay owned here so their buffers survive into the next batch;
+  // the consumer borrows them for the duration of this call only. Reset the
+  // count before the callback so a re-entrant output (lwIP emitting while the
+  // consumer runs) starts a fresh batch rather than resending these.
+  const OwnedPacketBatchView view(egress_slots_.data(), egress_count_);
+  egress_count_ = 0;
+  pending_egress_bytes_ = 0;
+  output_(view);
 }
 
 }  // namespace fptn::tunnel::flow

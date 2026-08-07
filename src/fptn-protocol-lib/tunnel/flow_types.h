@@ -75,6 +75,11 @@ struct OwnedPacket {
 
 using OwnedPacketBatch = std::vector<OwnedPacket>;
 #endif
-using PacketOutputCallback = std::function<void(OwnedPacketBatch)>;
+
+// Borrowed view of an egress batch, mirroring PacketBatchView on the ingress
+// side. The producer keeps ownership so it can recycle the packet buffers
+// between batches; consumers must copy anything they need to outlive the call.
+using OwnedPacketBatchView = std::span<const OwnedPacket>;
+using PacketOutputCallback = std::function<void(OwnedPacketBatchView)>;
 
 }  // namespace fptn::tunnel

@@ -67,6 +67,9 @@ struct StackCounters {
   std::atomic<std::uint64_t> lease_pool_exhaustions{0};
   std::atomic<std::uint64_t> egress_coalesce_packets{0};
   std::atomic<std::uint64_t> egress_coalesce_bytes{0};
+  // Number of batches handed to output_. output_packets / egress_batches is
+  // the mean packets-per-write; it was pinned at 1 before egress coalescing.
+  std::atomic<std::uint64_t> egress_batches{0};
   std::atomic<std::uint64_t> dropped_packets{0};
   std::atomic<std::uint64_t> active_tcp_flows{0};
   std::atomic<std::uint64_t> peak_tcp_flows{0};
@@ -220,6 +223,14 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink,
   static err_t OutputV6(
       struct netif* netif, struct pbuf* p, const ip6_addr_t* ipaddr);
   err_t OutputPacket(struct pbuf* p, std::uint8_t ip_version);
+  // Egress coalescing (executor thread only). lwIP calls OutputPacket once
+  // per segment, and forwarding each one separately costs a full packet-flow
+  // write plus its per-batch platform allocations for a single packet.
+  // OutputPacket accumulates instead; FlushEgress hands the whole batch to
+  // output_ once, either at the size/byte bound or at the end of the current
+  // executor turn.
+  void FlushEgress() noexcept;
+  void ScheduleEgressFlush() noexcept;
 
   err_t StartTcpListener();
   void StopTcpFlows() noexcept;
@@ -266,6 +277,16 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink,
   IUdpOutbound& udp_outbound_;
   PacketOutputCallback output_;
   StackCounters counters_;
+
+  // Egress batch under construction. Executor-thread confined, so unlocked.
+  // The slot vector and each slot's buffer are never released between
+  // batches: egress_count_ marks how many slots are live, so the steady state
+  // allocates nothing. Buffers are filled with assign(), which copies over
+  // existing storage rather than resize()'s value-initialise-then-overwrite.
+  OwnedPacketBatch egress_slots_;
+  std::size_t egress_count_ = 0;
+  std::size_t pending_egress_bytes_ = 0;
+  bool egress_flush_scheduled_ = false;
 
   std::atomic<bool> running_{false};
   std::atomic<bool> stop_teardown_done_{false};

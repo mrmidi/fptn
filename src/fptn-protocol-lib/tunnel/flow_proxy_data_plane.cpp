@@ -50,9 +50,9 @@ std::expected<void, TunnelError> FlowProxyDataPlane::Start() {
   auto stack = std::make_shared<flow::LwipStack>(executor,
       std::move(stack_config), *event_sink_, *router_, *tcp_outbound_,
       *udp_outbound_,
-      [output](OwnedPacketBatch batch) {
+      [output](OwnedPacketBatchView batch) {
         if (output) {
-          output(std::move(batch));
+          output(batch);
         }
       });
   stack->SetExecutorThreadId(runtime_.ThreadId());

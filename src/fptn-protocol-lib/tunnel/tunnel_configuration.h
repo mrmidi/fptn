@@ -40,7 +40,9 @@ struct TunnelFlowConfiguration {
 struct TunnelCallbacks {
   using PacketBatchCallback =
       std::function<void(fptn::common::network::BatchIPPacketPtr)>;
-  using OwnedPacketBatchCallback = std::function<void(OwnedPacketBatch)>;
+  // Borrowed for the duration of the call; the stack recycles the buffers
+  // afterwards, so consumers must copy anything they keep.
+  using OwnedPacketBatchCallback = std::function<void(OwnedPacketBatchView)>;
   using ConnectedCallback = std::function<void()>;
   using DisconnectedCallback =
       std::function<void(bool was_connected, const std::string& reason)>;
