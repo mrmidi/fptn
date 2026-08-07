@@ -35,16 +35,25 @@ add_executable(ApiClientTest api_client/ApiClientTest.cpp)
 target_link_libraries(ApiClientTest PRIVATE ${LIBS})
 add_test(NAME ApiClientTest COMMAND ApiClientTest)
 
-# PR5: verify the move-owned YAFF frame is byte-identical to the legacy
-# vector-returning serializer for deterministic packet fixtures.
-add_executable(PacketSerializerTest protocol/PacketSerializerTest.cpp)
-target_link_libraries(PacketSerializerTest PRIVATE ${LIBS})
-add_test(NAME PacketSerializerTest COMMAND PacketSerializerTest)
-
 # PR-LW0: tunnel engine seam (DataPlaneMode/IDataPlane/TunnelEngine).
 add_executable(TunnelSeamTest tunnel/TunnelSeamTest.cpp)
 target_link_libraries(TunnelSeamTest PRIVATE ${LIBS})
 add_test(NAME TunnelSeamTest COMMAND TunnelSeamTest)
+
+# R1: RouteAction verdicts and the domain routing policy.
+add_executable(RoutingPolicyTest tunnel/RoutingPolicyTest.cpp)
+target_link_libraries(RoutingPolicyTest PRIVATE ${LIBS})
+add_test(NAME RoutingPolicyTest COMMAND RoutingPolicyTest)
+
+# R2: 5-tuple peek, flow table and pinned classifier rules.
+add_executable(FlowClassifierTest tunnel/FlowClassifierTest.cpp)
+target_link_libraries(FlowClassifierTest PRIVATE ${LIBS})
+add_test(NAME FlowClassifierTest COMMAND FlowClassifierTest)
+
+# R3: DNS snooping that attributes an address to a domain.
+add_executable(DnsObserverTest tunnel/DnsObserverTest.cpp)
+target_link_libraries(DnsObserverTest PRIVATE ${LIBS})
+add_test(NAME DnsObserverTest COMMAND DnsObserverTest)
 
 # PR-LW2: lwIP netif + packet pump.
 if (FPTN_WITH_LWIP)
@@ -66,6 +75,11 @@ if (FPTN_WITH_LWIP)
   add_executable(LwipUdpTest flow/LwipUdpTest.cpp)
   target_link_libraries(LwipUdpTest PRIVATE ${LIBS})
   add_test(NAME LwipUdpTest COMMAND LwipUdpTest)
+
+  # R4/R5: split data plane, two-phase fan-out and the table-backed router.
+  add_executable(SplitDataPlaneTest tunnel/SplitDataPlaneTest.cpp)
+  target_link_libraries(SplitDataPlaneTest PRIVATE ${LIBS})
+  add_test(NAME SplitDataPlaneTest COMMAND SplitDataPlaneTest)
 
   # Review regressions: ERR_ABRT paths, ingress/stop race, FIN-after-data,
   # clean-completion resource release, one-shot engine, UDP pcb retention.

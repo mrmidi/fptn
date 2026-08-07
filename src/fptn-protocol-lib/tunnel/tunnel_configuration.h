@@ -37,6 +37,19 @@ struct TunnelFlowConfiguration {
   std::uint16_t mtu = 1400;
 };
 
+// Split-routing policy. Domains take the `domain:example.com` form or a bare
+// domain, and match the name itself plus any subdomain. Anything unmatched (or
+// unattributable, such as an IP-literal connection) is tunnelled.
+struct TunnelRoutingConfiguration {
+  std::vector<std::string> direct_domains;
+  std::vector<std::string> reject_domains;
+  std::vector<std::string> drop_domains;
+  // Resolvers advertised to the OS. They live behind the tunnel, so their
+  // traffic is pinned to the fptn verdict; this is what makes server-supplied
+  // DNS work in split mode.
+  std::vector<std::string> tunnel_resolvers;
+};
+
 struct TunnelCallbacks {
   using PacketBatchCallback =
       std::function<void(fptn::common::network::BatchIPPacketPtr)>;
@@ -57,6 +70,7 @@ struct TunnelConfiguration {
   DataPlaneMode mode = DataPlaneMode::l3_tunnel;
   TunnelL3Configuration l3;
   TunnelFlowConfiguration flow;
+  TunnelRoutingConfiguration routing;
 };
 
 }  // namespace fptn::tunnel

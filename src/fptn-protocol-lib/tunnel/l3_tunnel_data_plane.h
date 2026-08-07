@@ -12,6 +12,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 #include "fptn-protocol-lib/https/websocket_client/websocket_client.h"
 #include "fptn-protocol-lib/tunnel/i_data_plane.h"
+#include "fptn-protocol-lib/tunnel/websocket_batch.h"
 #include "fptn-protocol-lib/tunnel/tunnel_configuration.h"
 
 namespace fptn::tunnel {

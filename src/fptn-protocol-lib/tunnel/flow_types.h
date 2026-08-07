@@ -23,11 +23,34 @@ enum class TransportProtocol : std::uint8_t {
   udp = 1,
 };
 
+// Per-flow verdict. `reject` and `drop` are deliberately distinct: a blocked
+// site should fail fast and visibly (RST), while an ad/telemetry endpoint is
+// better black-holed, since an RST is itself a signal to the caller.
+//
+// Only `direct` and `reject` ever reach the lwIP stack. `drop` is discarded by
+// the classifier before ip_input(), and `fptn_l4` is forwarded untouched to the
+// L3 websocket path -- a terminated flow cannot be un-terminated, so the fptn
+// verdict has to be taken at packet ingress.
 enum class RouteAction : std::uint8_t {
   direct = 0,
   fptn_l4 = 1,
-  block = 2,
+  reject = 2,
+  drop = 3,
 };
+
+constexpr const char* ToString(RouteAction action) noexcept {
+  switch (action) {
+    case RouteAction::direct:
+      return "direct";
+    case RouteAction::fptn_l4:
+      return "fptn";
+    case RouteAction::reject:
+      return "reject";
+    case RouteAction::drop:
+      return "drop";
+  }
+  return "unknown";
+}
 
 enum class FlowError : std::uint8_t {
   none = 0,

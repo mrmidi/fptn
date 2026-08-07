@@ -468,29 +468,32 @@ void LwipStack::IngestLease(PacketLease lease) noexcept {
   }
 }
 
-PacketInputResult LwipStack::InputPackets(PacketBatchView packets) noexcept {
-  if (!IsRunning()) {
-    return PacketInputResult::transport_stopped;
-  }
-
-  std::uint64_t total_bytes = 0;
+bool LwipStack::ValidateIngressBatch(
+    PacketBatchView packets, std::uint64_t& total_bytes) noexcept {
+  total_bytes = 0;
   for (const auto& lease : packets) {
     if (lease.bytes == nullptr || lease.length == 0 ||
         lease.length > 0xFFFFU) {
-      return PacketInputResult::invalid_packet;
+      return false;
     }
     if (lease.ip_version != 0 && lease.ip_version != 4 &&
         lease.ip_version != 6) {
-      return PacketInputResult::invalid_packet;
+      return false;
     }
     total_bytes += lease.length;
   }
+  return true;
+}
 
+bool LwipStack::TryReserveIngress(std::uint64_t total_bytes) noexcept {
+  if (!IsRunning()) {
+    return false;
+  }
   const std::uint64_t previous =
       inflight_bytes_.fetch_add(total_bytes, std::memory_order_acq_rel);
   if (previous + total_bytes > config_.max_ingress_inflight_bytes) {
     inflight_bytes_.fetch_sub(total_bytes, std::memory_order_acq_rel);
-    return PacketInputResult::queue_full;
+    return false;
   }
 
   // Reserve the operation slot, then re-check the running flag so Stop can
@@ -499,9 +502,43 @@ PacketInputResult LwipStack::InputPackets(PacketBatchView packets) noexcept {
   if (!running_.load(std::memory_order_acquire)) {
     pending_ingress_ops_.fetch_sub(1, std::memory_order_release);
     inflight_bytes_.fetch_sub(total_bytes, std::memory_order_acq_rel);
+    return false;
+  }
+  return true;
+}
+
+void LwipStack::AbandonIngressReservation(std::uint64_t total_bytes) noexcept {
+  pending_ingress_ops_.fetch_sub(1, std::memory_order_release);
+  inflight_bytes_.fetch_sub(total_bytes, std::memory_order_acq_rel);
+}
+
+PacketInputResult LwipStack::InputPackets(PacketBatchView packets) noexcept {
+  if (!IsRunning()) {
     return PacketInputResult::transport_stopped;
   }
 
+  std::uint64_t total_bytes = 0;
+  if (!ValidateIngressBatch(packets, total_bytes)) {
+    return PacketInputResult::invalid_packet;
+  }
+
+  if (!TryReserveIngress(total_bytes)) {
+    return IsRunning() ? PacketInputResult::queue_full
+                       : PacketInputResult::transport_stopped;
+  }
+  // On a failed post nothing was consumed and the reservation is already
+  // rolled back, so the caller still owns every lease.
+  return CommitReservedIngress(packets, total_bytes)
+             ? PacketInputResult::accepted
+             : PacketInputResult::queue_full;
+}
+
+// Consumes a reservation taken by TryReserveIngress. Returns true once the
+// ingest operation is posted, at which point the stack owns every lease and
+// releases each exactly once. Returns false only when the post could not be
+// allocated: the reservation is rolled back and no lease has been touched.
+bool LwipStack::CommitReservedIngress(
+    PacketBatchView packets, std::uint64_t total_bytes) noexcept {
   try {
     // Ownership contract: returning `accepted` transfers every lease owner
     // to the engine. The descriptors are copied into the posted operation;
@@ -527,11 +564,10 @@ PacketInputResult LwipStack::InputPackets(PacketBatchView packets) noexcept {
           pending_ingress_ops_.fetch_sub(1, std::memory_order_release);
         });
   } catch (...) {
-    pending_ingress_ops_.fetch_sub(1, std::memory_order_release);
-    inflight_bytes_.fetch_sub(total_bytes, std::memory_order_acq_rel);
-    return PacketInputResult::queue_full;
+    AbandonIngressReservation(total_bytes);
+    return false;
   }
-  return PacketInputResult::accepted;
+  return true;
 }
 
 err_t LwipStack::NetifInit(struct netif* netif) {

@@ -12,6 +12,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 #ifdef FPTN_HAS_LWIP
 #include "fptn-protocol-lib/tunnel/flow_proxy_data_plane.h"
+#include "fptn-protocol-lib/tunnel/split_data_plane.h"
 #endif
 
 namespace fptn::tunnel {
@@ -35,6 +36,19 @@ std::expected<std::unique_ptr<TunnelEngine>, TunnelError> TunnelEngine::Create(
       return std::unique_ptr<TunnelEngine>(
           new TunnelEngine(mode, std::move(data_plane)));
     }
+    case DataPlaneMode::split: {
+#ifdef FPTN_HAS_LWIP
+      if (config.l3.server_ip.empty() || config.l3.server_port <= 0 ||
+          config.flow.tun_ipv4.empty()) {
+        return std::unexpected(TunnelError::invalid_configuration);
+      }
+      // Split mode needs a transport injected by the platform layer, so it
+      // is built through CreateSplit rather than here.
+      return std::unexpected(TunnelError::invalid_configuration);
+#else
+      break;
+#endif
+    }
     case DataPlaneMode::flow_proxy: {
 #ifdef FPTN_HAS_LWIP
       if (config.flow.tun_ipv4.empty()) {
@@ -50,6 +64,29 @@ std::expected<std::unique_ptr<TunnelEngine>, TunnelError> TunnelEngine::Create(
     }
   }
   return std::unexpected(TunnelError::unsupported_mode);
+}
+
+std::expected<std::unique_ptr<TunnelEngine>, TunnelError>
+TunnelEngine::CreateSplit(TunnelConfiguration config, TunnelCallbacks callbacks,
+    TransportProvider transport) {
+#ifdef FPTN_HAS_LWIP
+  if (config.l3.server_ip.empty() || config.l3.server_port <= 0 ||
+      config.flow.tun_ipv4.empty() || !transport) {
+    return std::unexpected(TunnelError::invalid_configuration);
+  }
+  auto data_plane = std::make_unique<SplitDataPlane>(
+      std::move(config), std::move(callbacks), std::move(transport));
+  auto* plane = data_plane.get();
+  std::unique_ptr<TunnelEngine> engine(
+      new TunnelEngine(DataPlaneMode::split, std::move(data_plane)));
+  engine->split_plane_ = plane;
+  return engine;
+#else
+  (void)config;
+  (void)callbacks;
+  (void)transport;
+  return std::unexpected(TunnelError::unsupported_mode);
+#endif
 }
 
 std::expected<void, TunnelError> TunnelEngine::Start() {

@@ -21,25 +21,6 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 namespace fptn::tunnel {
 
-namespace {
-
-PacketInputResult MapSendResult(
-    fptn::protocol::https::SendResult result) noexcept {
-  switch (result) {
-    case fptn::protocol::https::SendResult::accepted:
-      return PacketInputResult::accepted;
-    case fptn::protocol::https::SendResult::queue_full:
-      return PacketInputResult::queue_full;
-    case fptn::protocol::https::SendResult::transport_stopped:
-      return PacketInputResult::transport_stopped;
-    case fptn::protocol::https::SendResult::invalid_packet:
-      return PacketInputResult::invalid_packet;
-  }
-  return PacketInputResult::invalid_packet;
-}
-
-}  // namespace
-
 L3TunnelDataPlane::L3TunnelDataPlane(
     TunnelL3Configuration config, TunnelCallbacks callbacks)
     : config_(std::move(config)), callbacks_(std::move(callbacks)) {}
@@ -82,87 +63,21 @@ void L3TunnelDataPlane::Stop() noexcept {
 
 PacketInputResult L3TunnelDataPlane::InputPackets(
     PacketBatchView packets) noexcept {
-  if (!running_.load(std::memory_order_acquire)) {
-    return PacketInputResult::transport_stopped;
-  }
-  fptn::protocol::https::WebsocketClientSPtr client;
-  {
-    std::lock_guard lock(mutex_);
-    client = client_;
-  }
-  if (!client) {
-    return PacketInputResult::transport_stopped;
-  }
-
   // Ownership contract: on `accepted` the engine owns every lease and
   // releases each exactly once; on any other result the caller keeps every
   // lease. The L3 transport always copies packet bytes into its own queue,
   // so this is enforced by consuming leases only on the all-success path.
-
-  // 1. Validate every lease up front; reject before touching any lease.
-  std::uint64_t total_bytes = 0;
-  for (const auto& lease : packets) {
-    if (lease.bytes == nullptr || lease.length == 0) {
-      client->NoteRejectedBeforeCopy(packets.size(), total_bytes);
-      return PacketInputResult::invalid_packet;
-    }
-    if (lease.ip_version != 0 && lease.ip_version != 4 &&
-        lease.ip_version != 6) {
-      client->NoteRejectedBeforeCopy(packets.size(), total_bytes);
-      return PacketInputResult::invalid_packet;
-    }
-    // Header-only admission check (mirrors TrySendPacketBytes): avoid an
-    // allocation for malformed/non-IP input.
-    const std::uint8_t version = lease.bytes[0] >> 4;
-    if (lease.length < 20 ||
-        (version != 4 && (version != 6 || lease.length < 40))) {
-      client->NoteRejectedBeforeCopy(packets.size(), total_bytes);
-      return PacketInputResult::invalid_packet;
-    }
-    total_bytes += lease.length;
+  fptn::protocol::https::WebsocketClientSPtr client;
+  if (running_.load(std::memory_order_acquire)) {
+    std::lock_guard lock(mutex_);
+    client = client_;
   }
-
-  // 2. Reserve the whole batch atomically.
-  auto reservation = client->TryReserveBatch(packets.size(), total_bytes);
+  auto error = PacketInputResult::transport_stopped;
+  auto reservation = TryReserveWebsocketBatch(client, packets, error);
   if (!reservation) {
-    return PacketInputResult::queue_full;
+    return error;
   }
-
-  // 3. Copy + parse every packet before enqueueing anything, so a parse
-  // failure rejects the batch without consuming any lease. The RAII
-  // reservation rolls back the queue accounting on this path.
-  std::vector<fptn::common::network::IPPacketPtr> parsed;
-  try {
-    parsed.reserve(packets.size());
-    for (const auto& lease : packets) {
-      fptn::common::network::IPPacketData storage(
-          lease.bytes, lease.bytes + lease.length);
-      auto packet = fptn::common::network::IPPacket::Parse(std::move(storage));
-      if (!packet) {
-        client->NoteRejectedBeforeCopy(packets.size(), total_bytes);
-        return PacketInputResult::invalid_packet;
-      }
-      client->NoteAdmissionCopy(lease.length);
-      parsed.push_back(std::move(packet));
-    }
-  } catch (...) {
-    return PacketInputResult::invalid_packet;
-  }
-
-  // 4. Enqueue the whole batch. A mid-batch failure leaves already-enqueued
-  // copies in the transport but consumes no lease, so the caller still owns
-  // every lease and the RAII reservation releases the un-enqueued slots.
-  for (std::size_t i = 0; i < parsed.size(); ++i) {
-    reservation.ForgetPacket(packets[i].length);
-    const auto result = client->EnqueueReservedPacket(
-        std::move(parsed[i]), packets[i].length);
-    if (result != fptn::protocol::https::SendResult::accepted) {
-      return MapSendResult(result);
-    }
-  }
-
-  reservation.Commit();
-  ReleasePacketBatch(packets);
+  CommitWebsocketBatch(packets, std::move(reservation));
   return PacketInputResult::accepted;
 }
 

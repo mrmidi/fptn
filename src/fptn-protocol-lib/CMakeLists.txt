@@ -130,14 +130,29 @@ set(FPTN_CLIENT_PROTOCOL_SOURCES
     tunnel/i_data_plane.h
     tunnel/l3_tunnel_data_plane.h
     tunnel/l3_tunnel_data_plane.cpp
+    tunnel/dns_observer.h
+    tunnel/dns_observer.cpp
+    tunnel/flow_classifier.h
+    tunnel/flow_classifier.cpp
     tunnel/packet_types.h
+    tunnel/routing_policy.h
+    tunnel/routing_policy.cpp
     tunnel/tunnel_configuration.h
+    tunnel/websocket_batch.h
+    tunnel/websocket_batch.cpp
     tunnel/tunnel_engine.h
     tunnel/tunnel_engine.cpp
     tunnel/tunnel_error.h
     https/obfuscator/methods/detector.h)
 
 add_library("${PROJECT_NAME}_static" STATIC ${FPTN_CLIENT_PROTOCOL_SOURCES})
+
+# Compile debug-level log statements in and filter them at runtime instead of
+# at build time. A disabled log point costs almost nothing, and being able to
+# raise the level on a shipped build is the difference between diagnosing a
+# tunnel problem and guessing at it.
+target_compile_definitions("${PROJECT_NAME}_static"
+    PUBLIC SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_DEBUG)
 
 # PR-LW2: lwIP flow-proxy stack (optional capability).
 if (FPTN_WITH_LWIP)
@@ -154,7 +169,9 @@ if (FPTN_WITH_LWIP)
       tunnel/tunnel_runtime.h
       tunnel/tunnel_runtime.cpp
       tunnel/flow_proxy_data_plane.h
-      tunnel/flow_proxy_data_plane.cpp)
+      tunnel/flow_proxy_data_plane.cpp
+      tunnel/split_data_plane.h
+      tunnel/split_data_plane.cpp)
 endif()
 
 # PR1A: iOS socket buffer experiment parameter.

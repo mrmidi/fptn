@@ -163,6 +163,20 @@ class LwipStack final : public INetworkStack, public ITcpOutboundSink,
 
   PacketInputResult InputPackets(PacketBatchView packets) noexcept override;
 
+  // Two-phase ingress admission, for a caller that must reserve capacity on
+  // this stack *and* somewhere else before committing to either (the split
+  // data plane fanning one batch out across both planes). Validate, then
+  // reserve; either commit or abandon.
+  static bool ValidateIngressBatch(
+      PacketBatchView packets, std::uint64_t& total_bytes) noexcept;
+  bool TryReserveIngress(std::uint64_t total_bytes) noexcept;
+  void AbandonIngressReservation(std::uint64_t total_bytes) noexcept;
+  // True once the ingest is posted and the stack owns every lease; false only
+  // on allocation failure, which rolls the reservation back and touches no
+  // lease.
+  bool CommitReservedIngress(
+      PacketBatchView packets, std::uint64_t total_bytes) noexcept;
+
   WriteResult WriteTcp(FlowId flow, BufferSequence data) noexcept override;
   void FinishTcp(FlowId flow) noexcept override;
   void ResetTcp(FlowId flow) noexcept override;

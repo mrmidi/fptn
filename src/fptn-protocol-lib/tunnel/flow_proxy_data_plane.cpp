@@ -14,9 +14,11 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 namespace fptn::tunnel {
 
-FlowProxyDataPlane::FlowProxyDataPlane(
-    TunnelConfiguration config, TunnelCallbacks callbacks)
-    : config_(std::move(config)), callbacks_(std::move(callbacks)) {}
+FlowProxyDataPlane::FlowProxyDataPlane(TunnelConfiguration config,
+    TunnelCallbacks callbacks, IFlowRouter* router)
+    : config_(std::move(config)),
+      callbacks_(std::move(callbacks)),
+      injected_router_(router) {}
 
 FlowProxyDataPlane::~FlowProxyDataPlane() { Stop(); }
 
@@ -36,7 +38,12 @@ std::expected<void, TunnelError> FlowProxyDataPlane::Start() {
   }
   const auto executor = runtime_.Executor();
 
-  router_ = std::make_unique<DirectRouter>();
+  if (injected_router_ != nullptr) {
+    router_ = injected_router_;
+  } else {
+    owned_router_ = std::make_unique<DirectRouter>();
+    router_ = owned_router_.get();
+  }
   event_sink_ = std::make_unique<NullEventSink>();
   tcp_outbound_ = std::make_unique<flow::DirectTcpOutbound>(executor);
   udp_outbound_ = std::make_unique<flow::DirectUdpOutbound>(executor);
@@ -61,7 +68,8 @@ std::expected<void, TunnelError> FlowProxyDataPlane::Start() {
   if (!result.has_value()) {
     tcp_outbound_.reset();
     udp_outbound_.reset();
-    router_.reset();
+    owned_router_.reset();
+    router_ = nullptr;
     event_sink_.reset();
     runtime_.Stop();
     return result;
@@ -133,7 +141,8 @@ void FlowProxyDataPlane::Stop() noexcept {
   stack.reset();
   tcp_outbound_.reset();
   udp_outbound_.reset();
-  router_.reset();
+  owned_router_.reset();
+  router_ = nullptr;
   event_sink_.reset();
 }
 
@@ -188,6 +197,46 @@ std::uint64_t FlowProxyDataPlane::ActiveUdpFlowsForTesting() const noexcept {
              ? 0
              : stack_->counters().active_udp_flows.load(
                    std::memory_order_relaxed);
+}
+
+bool FlowProxyDataPlane::ValidateIngressBatch(
+    PacketBatchView packets, std::uint64_t& total_bytes) noexcept {
+  return flow::LwipStack::ValidateIngressBatch(packets, total_bytes);
+}
+
+bool FlowProxyDataPlane::TryReserveIngress(
+    std::uint64_t total_bytes) noexcept {
+  std::shared_ptr<flow::LwipStack> stack;
+  {
+    std::scoped_lock lock(stack_mutex_);
+    stack = stack_;
+  }
+  return stack && stack->TryReserveIngress(total_bytes);
+}
+
+void FlowProxyDataPlane::AbandonIngressReservation(
+    std::uint64_t total_bytes) noexcept {
+  std::shared_ptr<flow::LwipStack> stack;
+  {
+    std::scoped_lock lock(stack_mutex_);
+    stack = stack_;
+  }
+  if (stack) {
+    stack->AbandonIngressReservation(total_bytes);
+  }
+}
+
+bool FlowProxyDataPlane::CommitReservedIngress(
+    PacketBatchView packets, std::uint64_t total_bytes) noexcept {
+  std::shared_ptr<flow::LwipStack> stack;
+  {
+    std::scoped_lock lock(stack_mutex_);
+    stack = stack_;
+  }
+  if (!stack) {
+    return false;
+  }
+  return stack->CommitReservedIngress(packets, total_bytes);
 }
 
 PacketInputResult FlowProxyDataPlane::InputPackets(

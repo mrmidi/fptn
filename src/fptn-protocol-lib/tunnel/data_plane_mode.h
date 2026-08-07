@@ -11,8 +11,14 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 namespace fptn::tunnel {
 
 enum class DataPlaneMode : std::uint8_t {
+  // All traffic via the server. No lwIP. This is the "FPTN only" product mode
+  // and the path that has been shipping.
   l3_tunnel = 0,
+  // Direct only, no server. Development and profiling only -- it must never be
+  // reachable in a release build, since it leaves the user's real IP exposed.
   flow_proxy = 1,
+  // Direct and FPTN per policy: the "Split" product mode.
+  split = 2,
 };
 
 constexpr const char* ToString(DataPlaneMode mode) noexcept {
@@ -21,6 +27,8 @@ constexpr const char* ToString(DataPlaneMode mode) noexcept {
       return "L3Tunnel";
     case DataPlaneMode::flow_proxy:
       return "FlowProxy";
+    case DataPlaneMode::split:
+      return "Split";
   }
   return "Unknown";
 }

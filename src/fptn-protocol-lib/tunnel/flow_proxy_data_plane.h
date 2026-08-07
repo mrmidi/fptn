@@ -23,7 +23,11 @@ namespace fptn::tunnel {
 // engine per tunnel session.
 class FlowProxyDataPlane final : public IDataPlane {
  public:
-  FlowProxyDataPlane(TunnelConfiguration config, TunnelCallbacks callbacks);
+  // `router` is borrowed and may be null, in which case every flow is routed
+  // direct (the debug-only flow_proxy mode). The split data plane injects a
+  // router that reads verdicts already decided at packet ingress.
+  FlowProxyDataPlane(TunnelConfiguration config, TunnelCallbacks callbacks,
+      IFlowRouter* router = nullptr);
   ~FlowProxyDataPlane() override;
 
   FlowProxyDataPlane(const FlowProxyDataPlane&) = delete;
@@ -33,6 +37,16 @@ class FlowProxyDataPlane final : public IDataPlane {
   void Stop() noexcept override;
 
   PacketInputResult InputPackets(PacketBatchView packets) noexcept override;
+
+  // Two-phase ingress admission, so the split data plane can reserve here and
+  // on the websocket transport before committing either half of a batch.
+  // Mirrors LwipStack's contract; all three are no-ops once stopped.
+  static bool ValidateIngressBatch(
+      PacketBatchView packets, std::uint64_t& total_bytes) noexcept;
+  bool TryReserveIngress(std::uint64_t total_bytes) noexcept;
+  void AbandonIngressReservation(std::uint64_t total_bytes) noexcept;
+  bool CommitReservedIngress(
+      PacketBatchView packets, std::uint64_t total_bytes) noexcept;
 
   FlowCounters Counters() const noexcept override;
 
@@ -69,7 +83,10 @@ class FlowProxyDataPlane final : public IDataPlane {
   TunnelCallbacks callbacks_;
   TunnelRuntime runtime_;
 
-  std::unique_ptr<DirectRouter> router_;
+  // Borrowed when injected, owned when this plane supplies the default.
+  IFlowRouter* injected_router_ = nullptr;
+  std::unique_ptr<IFlowRouter> owned_router_;
+  IFlowRouter* router_ = nullptr;
   std::unique_ptr<NullEventSink> event_sink_;
   std::unique_ptr<flow::DirectTcpOutbound> tcp_outbound_;
   std::unique_ptr<flow::DirectUdpOutbound> udp_outbound_;
