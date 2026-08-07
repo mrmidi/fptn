@@ -95,6 +95,11 @@ class SplitDataPlane final : public IDataPlane {
 
   FlowCounters Counters() const noexcept override;
   SplitCounters SplitStatistics() const noexcept;
+  // Flows that reached the stack with no recorded verdict. Non-zero means the
+  // fan-out and the classifier table disagree.
+  std::uint64_t RouterUnknownFlows() const noexcept {
+    return router_ ? router_->unknown_flows() : 0;
+  }
 
   // Read-only tap for packets arriving from the transport, which is where DNS
   // answers appear and therefore where domain -> IP is observed. The platform

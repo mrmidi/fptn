@@ -82,6 +82,11 @@ void SplitDataPlane::ConfigureRouting() {
     }
   }
   classifier_->SetTunnelResolvers(resolvers);
+  if (resolvers.size() != config_.routing.tunnel_resolvers.size()) {
+    SPDLOG_WARN("{} of {} resolvers could not be parsed and are not pinned",
+        config_.routing.tunnel_resolvers.size() - resolvers.size(),
+        config_.routing.tunnel_resolvers.size());
+  }
 
   router_ = std::make_unique<TableBackedRouter>(*classifier_);
 
@@ -90,8 +95,7 @@ void SplitDataPlane::ConfigureRouting() {
       "default fptn",
       config_.routing.direct_domains.size(),
       config_.routing.reject_domains.size(),
-      config_.routing.drop_domains.size(),
-      config_.routing.tunnel_resolvers.size());
+      config_.routing.drop_domains.size(), resolvers.size());
 }
 
 std::expected<void, TunnelError> SplitDataPlane::Start() {
