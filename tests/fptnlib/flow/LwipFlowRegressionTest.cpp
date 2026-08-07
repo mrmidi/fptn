@@ -47,7 +47,7 @@ bool PollUntil(Predicate predicate,
 
 struct BlockingRouter final : IFlowRouter {
   RouteAction Match(const FlowMetadata&) override {
-    return RouteAction::block;
+    return RouteAction::reject;
   }
 };
 
@@ -59,7 +59,7 @@ class BlockedRouteRegressionTest : public ::testing::Test {
   void SetUp() override {
     stack_ = std::make_unique<LwipStack>(runtime_.Executor(),
         StackConfiguration{}, sink_, router_, tcp_outbound_, udp_outbound_,
-        [this](OwnedPacketBatch batch) { collector_.Append(std::move(batch)); });
+        [this](OwnedPacketBatchView batch) { collector_.Append(batch); });
     ASSERT_TRUE(stack_->Start().has_value());
   }
 
@@ -71,10 +71,17 @@ class BlockedRouteRegressionTest : public ::testing::Test {
   }
 
   PacketInputResult Inject(const std::vector<std::uint8_t>& packet) {
-    const PacketLease lease{packet.data(),
-        static_cast<std::uint32_t>(packet.size()), 4, nullptr, nullptr};
+    // Must own the bytes: ingress is posted to the executor and zero-copy
+    // ingress borrows the lease well after this call returns, while callers
+    // pass temporaries.
+    PacketLease lease = leases_.Make(packet, 4);
     const PacketLease batch[] = {lease};
-    return stack_->InputPackets(batch);
+    const PacketInputResult result = stack_->InputPackets(batch);
+    if (result != PacketInputResult::accepted) {
+      // Ownership stays with the caller on any non-accepted result.
+      ReleasePacketLease(lease);
+    }
+    return result;
   }
 
   TestRuntime runtime_;
@@ -83,6 +90,7 @@ class BlockedRouteRegressionTest : public ::testing::Test {
   FakeTcpOutbound tcp_outbound_;
   FakeUdpOutbound udp_outbound_;
   OutputCollector collector_;
+  LeaseFactory leases_;
   std::unique_ptr<LwipStack> stack_;
 };
 
@@ -189,7 +197,7 @@ class UdpFailedOpenRegressionTest : public ::testing::Test {
     udp_outbound_.SetFailOpen(true);
     stack_ = std::make_unique<LwipStack>(runtime_.Executor(),
         StackConfiguration{}, sink_, router_, tcp_outbound_, udp_outbound_,
-        [this](OwnedPacketBatch batch) { collector_.Append(std::move(batch)); });
+        [this](OwnedPacketBatchView batch) { collector_.Append(batch); });
     ASSERT_TRUE(stack_->Start().has_value());
   }
 
@@ -201,10 +209,17 @@ class UdpFailedOpenRegressionTest : public ::testing::Test {
   }
 
   PacketInputResult Inject(const std::vector<std::uint8_t>& packet) {
-    const PacketLease lease{packet.data(),
-        static_cast<std::uint32_t>(packet.size()), 4, nullptr, nullptr};
+    // Must own the bytes: ingress is posted to the executor and zero-copy
+    // ingress borrows the lease well after this call returns, while callers
+    // pass temporaries.
+    PacketLease lease = leases_.Make(packet, 4);
     const PacketLease batch[] = {lease};
-    return stack_->InputPackets(batch);
+    const PacketInputResult result = stack_->InputPackets(batch);
+    if (result != PacketInputResult::accepted) {
+      // Ownership stays with the caller on any non-accepted result.
+      ReleasePacketLease(lease);
+    }
+    return result;
   }
 
   TestRuntime runtime_;
@@ -213,6 +228,7 @@ class UdpFailedOpenRegressionTest : public ::testing::Test {
   FakeTcpOutbound tcp_outbound_;
   FakeUdpOutbound udp_outbound_;
   OutputCollector collector_;
+  LeaseFactory leases_;
   std::unique_ptr<LwipStack> stack_;
 };
 
@@ -240,8 +256,8 @@ class EngineRegressionTest : public ::testing::Test {
     config.mode = DataPlaneMode::flow_proxy;
     config.flow.tun_ipv4 = kAppIp;
     config.l3.tun_ipv6 = "fd00::1";
-    callbacks_.on_owned_packet_batch = [this](OwnedPacketBatch batch) {
-      collector_.Append(std::move(batch));
+    callbacks_.on_owned_packet_batch = [this](OwnedPacketBatchView batch) {
+      collector_.Append(batch);
     };
     auto result = TunnelEngine::Create(config, callbacks_);
     ASSERT_TRUE(result.has_value());
@@ -258,11 +274,17 @@ class EngineRegressionTest : public ::testing::Test {
 
   PacketInputResult Inject(const std::vector<std::uint8_t>& packet,
       std::uint8_t ip_version = 4) {
-    const PacketLease lease{packet.data(),
-        static_cast<std::uint32_t>(packet.size()), ip_version, nullptr,
-        nullptr};
+    // Must own the bytes: ingress is posted to the executor and zero-copy
+    // ingress borrows the lease well after this call returns, while callers
+    // pass temporaries.
+    PacketLease lease = leases_.Make(packet, ip_version);
     const PacketLease batch[] = {lease};
-    return engine_->InputPackets(batch);
+    const PacketInputResult result = engine_->InputPackets(batch);
+    if (result != PacketInputResult::accepted) {
+      // Ownership stays with the caller on any non-accepted result.
+      ReleasePacketLease(lease);
+    }
+    return result;
   }
 
   bool Handshake(std::uint16_t dst_port) {
@@ -334,6 +356,7 @@ class EngineRegressionTest : public ::testing::Test {
 
   TunnelCallbacks callbacks_;
   OutputCollector collector_;
+  LeaseFactory leases_;
   std::unique_ptr<TunnelEngine> engine_;
   std::uint32_t client_seq_ = 0;
   std::uint32_t server_seq_ = 0;
@@ -432,7 +455,7 @@ class ManyConnectionsRegressionTest : public ::testing::Test {
     tcp_outbound_ = std::make_unique<DirectTcpOutbound>(executor);
     stack_ = std::make_unique<LwipStack>(executor, StackConfiguration{},
         sink_, router_, *tcp_outbound_, udp_outbound_,
-        [this](OwnedPacketBatch batch) { collector_.Append(std::move(batch)); });
+        [this](OwnedPacketBatchView batch) { collector_.Append(batch); });
     stack_->SetExecutorThreadId(runtime_.ThreadId());
     ASSERT_TRUE(stack_->Start().has_value());
   }
@@ -462,6 +485,7 @@ class ManyConnectionsRegressionTest : public ::testing::Test {
   TestRouter router_;
   FakeUdpOutbound udp_outbound_;
   OutputCollector collector_;
+  LeaseFactory leases_;
   std::unique_ptr<DirectTcpOutbound> tcp_outbound_;
   std::unique_ptr<LwipStack> stack_;
 };
@@ -478,10 +502,11 @@ TEST_F(ManyConnectionsRegressionTest, CleanConnectionsReleaseAllState) {
     const std::uint64_t prev_opened = tcp_outbound_->OpenedTotal();
 
     collector_.Reset();
-    const auto syn = MakeTcpV4(kAppIp, kDstIp, app_port, server.port(),
-        iss, 0, kFlagSyn);
-    const PacketLease lease{syn.data(),
-        static_cast<std::uint32_t>(syn.size()), 4, nullptr, nullptr};
+    // The lease must own its bytes: ingress is posted to the executor and
+    // zero-copy ingress borrows them well after InputPackets returns.
+    const PacketLease lease = leases_.Make(
+        MakeTcpV4(kAppIp, kDstIp, app_port, server.port(), iss, 0, kFlagSyn),
+        4);
     const PacketLease batch[] = {lease};
     ASSERT_EQ(stack_->InputPackets(batch), PacketInputResult::accepted);
 
@@ -502,10 +527,10 @@ TEST_F(ManyConnectionsRegressionTest, CleanConnectionsReleaseAllState) {
     std::uint32_t client_seq = iss + 1;
     auto inject = [&](std::uint8_t flags,
                       const std::vector<std::uint8_t>& payload) {
-      const auto packet = MakeTcpV4(kAppIp, kDstIp, app_port, server.port(),
-          client_seq, server_seq, flags, payload);
-      const PacketLease l{packet.data(),
-          static_cast<std::uint32_t>(packet.size()), 4, nullptr, nullptr};
+      const PacketLease l = leases_.Make(
+          MakeTcpV4(kAppIp, kDstIp, app_port, server.port(), client_seq,
+              server_seq, flags, payload),
+          4);
       const PacketLease b[] = {l};
       ASSERT_EQ(stack_->InputPackets(b), PacketInputResult::accepted);
       client_seq += static_cast<std::uint32_t>(payload.size());

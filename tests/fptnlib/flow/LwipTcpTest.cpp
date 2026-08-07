@@ -45,7 +45,7 @@ class LwipTcpTest : public ::testing::Test {
   void SetUp() override {
     stack_ = std::make_unique<LwipStack>(runtime_.Executor(),
         StackConfiguration{}, sink_, router_, outbound_, udp_outbound_,
-        [this](OwnedPacketBatch batch) { collector_.Append(std::move(batch)); });
+        [this](OwnedPacketBatchView batch) { collector_.Append(batch); });
     ASSERT_TRUE(stack_->Start().has_value());
   }
 
@@ -85,10 +85,16 @@ class LwipTcpTest : public ::testing::Test {
   }
 
   PacketInputResult Inject(const std::vector<std::uint8_t>& packet) {
-    const PacketLease lease{packet.data(),
-        static_cast<std::uint32_t>(packet.size()), 4, nullptr, nullptr};
+    // Must own the bytes: zero-copy ingress borrows the lease through a
+    // PBUF_REF pbuf that can outlive this call, and callers pass temporaries.
+    PacketLease lease = leases_.Make(packet, 4);
     const PacketLease batch[] = {lease};
-    return stack_->InputPackets(batch);
+    const PacketInputResult result = stack_->InputPackets(batch);
+    if (result != PacketInputResult::accepted) {
+      // Ownership stays with the caller on any non-accepted result.
+      ReleasePacketLease(lease);
+    }
+    return result;
   }
 
   const OwnedPacket* FindPacket(std::uint8_t required_flags,
@@ -150,6 +156,7 @@ class LwipTcpTest : public ::testing::Test {
   FakeTcpOutbound outbound_;
   FakeUdpOutbound udp_outbound_;
   OutputCollector collector_;
+  LeaseFactory leases_;
   std::unique_ptr<LwipStack> stack_;
   std::vector<OwnedPacket> packets_;
   std::uint32_t client_seq_ = 0;

@@ -19,7 +19,7 @@ class LwipStackTest : public ::testing::Test {
   void SetUp() override {
     stack_ = std::make_unique<LwipStack>(runtime_.Executor(),
         StackConfiguration{}, sink_, router_, outbound_, udp_outbound_,
-        [this](OwnedPacketBatch batch) { collector_.Append(std::move(batch)); });
+        [this](OwnedPacketBatchView batch) { collector_.Append(batch); });
   }
 
   void TearDown() override {
@@ -113,7 +113,7 @@ TEST_F(LwipStackTest, IngressBudgetRejectsOversizedBatch) {
   config.max_ingress_inflight_bytes = 32;
   auto bounded = std::make_unique<LwipStack>(runtime_.Executor(),
       std::move(config), sink_, router_, outbound_, udp_outbound_,
-      [this](OwnedPacketBatch batch) { collector_.Append(std::move(batch)); });
+      [this](OwnedPacketBatchView batch) { collector_.Append(batch); });
   ASSERT_TRUE(bounded->Start().has_value());
 
   const auto packet = MakeTcpV4(

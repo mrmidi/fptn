@@ -215,12 +215,12 @@ class TestRouter final : public IFlowRouter {
 
 class OutputCollector final {
  public:
-  void Append(OwnedPacketBatch batch) {
+  // The batch is borrowed for the duration of the call: the stack recycles
+  // its egress slots between batches, so every packet must be copied here.
+  void Append(OwnedPacketBatchView batch) {
     {
       std::lock_guard lock(mutex_);
-      for (auto& packet : batch) {
-        packets_.push_back(std::move(packet));
-      }
+      packets_.insert(packets_.end(), batch.begin(), batch.end());
     }
     cv_.notify_all();
   }

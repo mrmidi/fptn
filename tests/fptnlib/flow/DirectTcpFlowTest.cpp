@@ -43,8 +43,8 @@ class DirectTcpFlowTest : public ::testing::Test {
     config.mode = DataPlaneMode::flow_proxy;
     config.flow.tun_ipv4 = kAppIp;
     config.l3.tun_ipv6 = "fd00::1";
-    callbacks_.on_owned_packet_batch = [this](OwnedPacketBatch batch) {
-      collector_.Append(std::move(batch));
+    callbacks_.on_owned_packet_batch = [this](OwnedPacketBatchView batch) {
+      collector_.Append(batch);
     };
     auto result = TunnelEngine::Create(config, callbacks_);
     ASSERT_TRUE(result.has_value());
@@ -60,10 +60,17 @@ class DirectTcpFlowTest : public ::testing::Test {
   }
 
   PacketInputResult Inject(const std::vector<std::uint8_t>& packet) {
-    const PacketLease lease{packet.data(),
-        static_cast<std::uint32_t>(packet.size()), 4, nullptr, nullptr};
+    // Must own the bytes: ingress is posted to the executor and zero-copy
+    // ingress borrows the lease well after this call returns, while callers
+    // pass temporaries.
+    PacketLease lease = leases_.Make(packet, 4);
     const PacketLease batch[] = {lease};
-    return engine_->InputPackets(batch);
+    const PacketInputResult result = engine_->InputPackets(batch);
+    if (result != PacketInputResult::accepted) {
+      // Ownership stays with the caller on any non-accepted result.
+      ReleasePacketLease(lease);
+    }
+    return result;
   }
 
   bool Handshake(std::uint16_t dst_port) {
@@ -149,6 +156,7 @@ class DirectTcpFlowTest : public ::testing::Test {
 
   TunnelCallbacks callbacks_;
   OutputCollector collector_;
+  LeaseFactory leases_;
   std::unique_ptr<TunnelEngine> engine_;
   std::uint32_t client_seq_ = 0;
   std::uint32_t server_seq_ = 0;

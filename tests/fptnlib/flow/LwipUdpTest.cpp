@@ -105,8 +105,8 @@ class LwipUdpEngineTest : public ::testing::Test {
     config.mode = DataPlaneMode::flow_proxy;
     config.flow.tun_ipv4 = kAppIp;
     config.l3.tun_ipv6 = "fd00::1";
-    callbacks_.on_owned_packet_batch = [this](OwnedPacketBatch batch) {
-      collector_.Append(std::move(batch));
+    callbacks_.on_owned_packet_batch = [this](OwnedPacketBatchView batch) {
+      collector_.Append(batch);
     };
     auto result = TunnelEngine::Create(config, callbacks_);
     ASSERT_TRUE(result.has_value());
@@ -123,15 +123,22 @@ class LwipUdpEngineTest : public ::testing::Test {
 
   PacketInputResult Inject(const std::vector<std::uint8_t>& packet,
       std::uint8_t ip_version) {
-    const PacketLease lease{packet.data(),
-        static_cast<std::uint32_t>(packet.size()), ip_version, nullptr,
-        nullptr};
+    // Must own the bytes: ingress is posted to the executor and zero-copy
+    // ingress borrows the lease well after this call returns, while callers
+    // pass temporaries.
+    PacketLease lease = leases_.Make(packet, ip_version);
     const PacketLease batch[] = {lease};
-    return engine_->InputPackets(batch);
+    const PacketInputResult result = engine_->InputPackets(batch);
+    if (result != PacketInputResult::accepted) {
+      // Ownership stays with the caller on any non-accepted result.
+      ReleasePacketLease(lease);
+    }
+    return result;
   }
 
   TunnelCallbacks callbacks_;
   OutputCollector collector_;
+  LeaseFactory leases_;
   std::unique_ptr<TunnelEngine> engine_;
 };
 
@@ -251,7 +258,7 @@ class LwipUdpStackTest : public ::testing::Test {
   void SetUp() override {
     stack_ = std::make_unique<LwipStack>(runtime_.Executor(),
         stack_config_, sink_, router_, tcp_outbound_, udp_outbound_,
-        [this](OwnedPacketBatch batch) { collector_.Append(std::move(batch)); });
+        [this](OwnedPacketBatchView batch) { collector_.Append(batch); });
     ASSERT_TRUE(stack_->Start().has_value());
   }
 
@@ -278,10 +285,17 @@ class LwipUdpStackTest : public ::testing::Test {
   }
 
   PacketInputResult Inject(const std::vector<std::uint8_t>& packet) {
-    const PacketLease lease{packet.data(),
-        static_cast<std::uint32_t>(packet.size()), 4, nullptr, nullptr};
+    // Must own the bytes: ingress is posted to the executor and zero-copy
+    // ingress borrows the lease well after this call returns, while callers
+    // pass temporaries.
+    PacketLease lease = leases_.Make(packet, 4);
     const PacketLease batch[] = {lease};
-    return stack_->InputPackets(batch);
+    const PacketInputResult result = stack_->InputPackets(batch);
+    if (result != PacketInputResult::accepted) {
+      // Ownership stays with the caller on any non-accepted result.
+      ReleasePacketLease(lease);
+    }
+    return result;
   }
 
   StackConfiguration stack_config_;
@@ -291,6 +305,7 @@ class LwipUdpStackTest : public ::testing::Test {
   FakeTcpOutbound tcp_outbound_;
   FakeUdpOutbound udp_outbound_;
   OutputCollector collector_;
+  LeaseFactory leases_;
   std::unique_ptr<LwipStack> stack_;
 };
 
@@ -347,7 +362,7 @@ TEST_F(LwipUdpStackTest, IdleAssociationExpires) {
   stack_config_.udp_idle_timeout = std::chrono::milliseconds(150);
   stack_ = std::make_unique<LwipStack>(runtime_.Executor(), stack_config_,
       sink_, router_, tcp_outbound_, udp_outbound_,
-      [this](OwnedPacketBatch batch) { collector_.Append(std::move(batch)); });
+      [this](OwnedPacketBatchView batch) { collector_.Append(batch); });
   ASSERT_TRUE(stack_->Start().has_value());
 
   const std::vector<std::uint8_t> payload = {'x'};
@@ -373,7 +388,7 @@ TEST_F(LwipUdpStackTest, AssociationLimitDropsNewTuples) {
   stack_config_.max_udp_associations = 1;
   stack_ = std::make_unique<LwipStack>(runtime_.Executor(), stack_config_,
       sink_, router_, tcp_outbound_, udp_outbound_,
-      [this](OwnedPacketBatch batch) { collector_.Append(std::move(batch)); });
+      [this](OwnedPacketBatchView batch) { collector_.Append(batch); });
   ASSERT_TRUE(stack_->Start().has_value());
 
   const std::vector<std::uint8_t> payload = {'a'};
