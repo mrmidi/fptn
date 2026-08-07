@@ -1290,7 +1290,7 @@ std::vector<std::uint8_t> WebsocketClient::GenerateHandshakePacket() const {
           camouflage::tls::yandex_browser::Version::kV_24_12_0_1772);
       break;
     default:
-      SPDLOG_DEBUG("Using fallback handshake generator for SNI: {}", sni_);
+      SPDLOG_DEBUG("Using fallback handshake generator for SNI: {}", config_.sni);
       return utils::GenerateDecoyTlsHandshake(config_.sni);
   }
 
