@@ -8,6 +8,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 #include <expected>
 
+#include "fptn-protocol-lib/tunnel/flow_counters.h"
 #include "fptn-protocol-lib/tunnel/packet_types.h"
 #include "fptn-protocol-lib/tunnel/tunnel_error.h"
 
@@ -24,6 +25,10 @@ class IDataPlane {
   // `accepted` the plane owns every lease and releases each exactly once;
   // on any other result the caller still owns every lease.
   virtual PacketInputResult InputPackets(PacketBatchView packets) noexcept = 0;
+
+  // Diagnostic snapshot. Non-pure: planes without internal flow state (the
+  // L3 transport) keep the zeroed default.
+  virtual FlowCounters Counters() const noexcept { return {}; }
 };
 
 }  // namespace fptn::tunnel

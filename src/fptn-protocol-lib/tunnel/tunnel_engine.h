@@ -36,6 +36,10 @@ class TunnelEngine final {
   // on any other result the caller still owns every lease.
   PacketInputResult InputPackets(PacketBatchView packets) noexcept;
 
+  // Diagnostic snapshot of the active data plane; zeroed for planes that
+  // keep no flow state.
+  FlowCounters Counters() const noexcept;
+
   DataPlaneMode mode() const noexcept { return mode_; }
   bool IsStarted() const noexcept {
     return started_.load(std::memory_order_acquire);

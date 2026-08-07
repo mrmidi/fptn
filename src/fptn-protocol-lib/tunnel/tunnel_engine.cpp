@@ -77,4 +77,10 @@ PacketInputResult TunnelEngine::InputPackets(PacketBatchView packets) noexcept {
   return data_plane_->InputPackets(packets);
 }
 
+FlowCounters TunnelEngine::Counters() const noexcept {
+  // Deliberately not gated on started_: the plane retains its final tallies
+  // through Stop(), which is exactly when a post-mortem read happens.
+  return data_plane_ ? data_plane_->Counters() : FlowCounters{};
+}
+
 }  // namespace fptn::tunnel

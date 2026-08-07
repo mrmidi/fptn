@@ -34,6 +34,8 @@ class FlowProxyDataPlane final : public IDataPlane {
 
   PacketInputResult InputPackets(PacketBatchView packets) noexcept override;
 
+  FlowCounters Counters() const noexcept override;
+
   std::uint64_t ReentrantStopAttempts() const noexcept {
     return reentrant_stop_attempts_.load(std::memory_order_relaxed);
   }
@@ -75,6 +77,11 @@ class FlowProxyDataPlane final : public IDataPlane {
   // local reference, observe !IsRunning(), and drop it.
   std::shared_ptr<flow::LwipStack> stack_;
   mutable std::mutex stack_mutex_;
+  // Requires stack_mutex_ and a non-null stack_.
+  FlowCounters SnapshotLocked() const noexcept;
+  // Final tallies captured during Stop(), so a post-mortem read after
+  // teardown still reports what the session did rather than zeroes.
+  FlowCounters last_counters_;
 
   std::atomic<bool> started_{false};
   bool stopped_ever_{false};

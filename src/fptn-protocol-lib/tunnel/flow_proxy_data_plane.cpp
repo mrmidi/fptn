@@ -95,6 +95,11 @@ void FlowProxyDataPlane::Stop() noexcept {
   std::shared_ptr<flow::LwipStack> stack;
   {
     std::scoped_lock lock(stack_mutex_);
+    if (stack_) {
+      // Capture before the stack goes away; the outbounds are still alive
+      // here and are only destroyed further down.
+      last_counters_ = SnapshotLocked();
+    }
     stack = std::move(stack_);
   }
   if (stack) {
@@ -130,6 +135,46 @@ void FlowProxyDataPlane::Stop() noexcept {
   udp_outbound_.reset();
   router_.reset();
   event_sink_.reset();
+}
+
+// The whole snapshot is taken under stack_mutex_: Stop() clears stack_ while
+// holding it and only destroys the outbounds afterwards, so holding it for
+// the entire read keeps every pointer here alive.
+FlowCounters FlowProxyDataPlane::Counters() const noexcept {
+  std::scoped_lock lock(stack_mutex_);
+  return stack_ == nullptr ? last_counters_ : SnapshotLocked();
+}
+
+FlowCounters FlowProxyDataPlane::SnapshotLocked() const noexcept {
+  FlowCounters out;
+  const auto& c = stack_->counters();
+  const auto load = [](const std::atomic<std::uint64_t>& v) {
+    return v.load(std::memory_order_relaxed);
+  };
+  out.input_packets = load(c.input_packets);
+  out.input_bytes = load(c.input_bytes);
+  out.ingress_zero_copy_packets = load(c.ingress_zero_copy_packets);
+  out.ingress_copy_packets = load(c.ingress_copy_packets);
+  out.lease_pool_exhaustions = load(c.lease_pool_exhaustions);
+  out.dropped_packets = load(c.dropped_packets);
+  out.active_tcp_flows = load(c.active_tcp_flows);
+  out.peak_tcp_flows = load(c.peak_tcp_flows);
+  out.active_udp_flows = load(c.active_udp_flows);
+  out.peak_udp_flows = load(c.peak_udp_flows);
+  out.tcp_backpressure_events = load(c.tcp_backpressure_events);
+  out.tcp_resets = load(c.tcp_resets);
+  out.udp_drops = load(c.udp_drops);
+  out.output_packets = load(c.output_packets);
+  out.output_bytes = load(c.output_bytes);
+  out.egress_batches = load(c.egress_batches);
+  if (tcp_outbound_) {
+    out.tcp_outbound_active = tcp_outbound_->ActiveFlows();
+    out.tcp_outbound_opened_total = tcp_outbound_->OpenedTotal();
+  }
+  if (udp_outbound_) {
+    out.udp_outbound_active = udp_outbound_->ActiveFlows();
+  }
+  return out;
 }
 
 std::uint64_t FlowProxyDataPlane::ActiveTcpFlowsForTesting() const noexcept {
