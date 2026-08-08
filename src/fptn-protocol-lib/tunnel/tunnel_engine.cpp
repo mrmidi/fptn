@@ -68,14 +68,16 @@ std::expected<std::unique_ptr<TunnelEngine>, TunnelError> TunnelEngine::Create(
 
 std::expected<std::unique_ptr<TunnelEngine>, TunnelError>
 TunnelEngine::CreateSplit(TunnelConfiguration config, TunnelCallbacks callbacks,
-    TransportProvider transport) {
+    TransportProvider transport,
+    std::shared_ptr<const IRoutingPolicy> routing_policy) {
 #ifdef FPTN_HAS_LWIP
   if (config.l3.server_ip.empty() || config.l3.server_port <= 0 ||
       config.flow.tun_ipv4.empty() || !transport) {
     return std::unexpected(TunnelError::invalid_configuration);
   }
   auto data_plane = std::make_unique<SplitDataPlane>(
-      std::move(config), std::move(callbacks), std::move(transport));
+      std::move(config), std::move(callbacks), std::move(transport),
+      std::move(routing_policy));
   auto* plane = data_plane.get();
   std::unique_ptr<TunnelEngine> engine(
       new TunnelEngine(DataPlaneMode::split, std::move(data_plane)));
@@ -85,6 +87,7 @@ TunnelEngine::CreateSplit(TunnelConfiguration config, TunnelCallbacks callbacks,
   (void)config;
   (void)callbacks;
   (void)transport;
+  (void)routing_policy;
   return std::unexpected(TunnelError::unsupported_mode);
 #endif
 }

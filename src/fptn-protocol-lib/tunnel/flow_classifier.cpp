@@ -150,6 +150,17 @@ IpKey ToIpKey(const boost::asio::ip::address& address) noexcept {
   return key;
 }
 
+boost::asio::ip::address FromIpKey(const IpKey& key) noexcept {
+  if (key.version == 6) {
+    boost::asio::ip::address_v6::bytes_type raw{};
+    std::memcpy(raw.data(), key.bytes.data(), raw.size());
+    return boost::asio::ip::address_v6(raw);
+  }
+  boost::asio::ip::address_v4::bytes_type raw{};
+  std::memcpy(raw.data(), key.bytes.data(), raw.size());
+  return boost::asio::ip::address_v4(raw);
+}
+
 FlowClassifier::FlowClassifier(ClassifierConfiguration config,
     const IRoutingPolicy& policy, const IDomainAttribution& attribution)
     : config_(config), policy_(policy), attribution_(attribution) {}
@@ -243,7 +254,12 @@ RouteAction FlowClassifier::DecideLocked(const FiveTuple& tuple,
 
   FlowMetadata metadata;
   metadata.protocol = tuple.protocol;
+  // The addresses matter as much as the ports: a policy that matches on the
+  // destination (the compiled geo tables) sees whatever is in here, so leaving
+  // it default-constructed would have every flow asking about 0.0.0.0.
+  metadata.destination.address = FromIpKey(destination);
   metadata.destination.port = destination_port;
+  metadata.source.address = FromIpKey(tuple.source);
   metadata.source.port = tuple.source_port;
 
   const std::string domain = attribution_.LookupDomain(destination);

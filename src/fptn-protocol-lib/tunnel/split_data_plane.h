@@ -82,7 +82,8 @@ struct SplitCounters {
 class SplitDataPlane final : public IDataPlane {
  public:
   SplitDataPlane(TunnelConfiguration config, TunnelCallbacks callbacks,
-      TransportProvider transport);
+      TransportProvider transport,
+      std::shared_ptr<const IRoutingPolicy> routing_policy = nullptr);
   ~SplitDataPlane() override;
 
   SplitDataPlane(const SplitDataPlane&) = delete;
@@ -123,7 +124,11 @@ class SplitDataPlane final : public IDataPlane {
   TunnelConfiguration config_;
   TunnelCallbacks callbacks_;
 
-  std::unique_ptr<StaticDomainPolicy> policy_;
+  // The platform may inject an immutable compiled policy (the Apple split
+  // bridge does this for the shared geo database). Keep the explicit lists as
+  // a compatibility fallback for native callers and tests.
+  std::shared_ptr<const IRoutingPolicy> configured_policy_;
+  std::shared_ptr<const IRoutingPolicy> policy_;
   std::unique_ptr<DnsObserver> dns_observer_;
   std::unique_ptr<FlowClassifier> classifier_;
   std::unique_ptr<TableBackedRouter> router_;

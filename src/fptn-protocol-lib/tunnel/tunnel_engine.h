@@ -32,7 +32,8 @@ class TunnelEngine final {
   // keeps carrying fptn-verdict traffic, and a reconnect leaves lwIP alone.
   static std::expected<std::unique_ptr<TunnelEngine>, TunnelError> CreateSplit(
       TunnelConfiguration config, TunnelCallbacks callbacks,
-      TransportProvider transport);
+      TransportProvider transport,
+      std::shared_ptr<const IRoutingPolicy> routing_policy = nullptr);
 
   // Split mode only; null otherwise. The platform layer needs the plane to
   // feed it the inbound DNS tap. Borrowed -- the engine keeps ownership.

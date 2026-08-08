@@ -53,18 +53,26 @@ RouteAction TableBackedRouter::Match(const FlowMetadata& metadata) {
 }
 
 SplitDataPlane::SplitDataPlane(TunnelConfiguration config,
-    TunnelCallbacks callbacks, TransportProvider transport)
+    TunnelCallbacks callbacks, TransportProvider transport,
+    std::shared_ptr<const IRoutingPolicy> routing_policy)
     : config_(std::move(config)),
       callbacks_(std::move(callbacks)),
+      configured_policy_(std::move(routing_policy)),
       transport_(std::move(transport)) {}
 
 SplitDataPlane::~SplitDataPlane() { Stop(); }
 
 void SplitDataPlane::ConfigureRouting() {
-  policy_ = std::make_unique<StaticDomainPolicy>(RouteAction::fptn_l4);
-  policy_->AddRules(config_.routing.direct_domains, RouteAction::direct);
-  policy_->AddRules(config_.routing.reject_domains, RouteAction::reject);
-  policy_->AddRules(config_.routing.drop_domains, RouteAction::drop);
+  if (configured_policy_) {
+    policy_ = configured_policy_;
+  } else {
+    auto static_policy = std::make_shared<StaticDomainPolicy>(
+        RouteAction::fptn_l4);
+    static_policy->AddRules(config_.routing.direct_domains, RouteAction::direct);
+    static_policy->AddRules(config_.routing.reject_domains, RouteAction::reject);
+    static_policy->AddRules(config_.routing.drop_domains, RouteAction::drop);
+    policy_ = std::move(static_policy);
+  }
 
   dns_observer_ = std::make_unique<DnsObserver>();
   classifier_ = std::make_unique<FlowClassifier>(
@@ -92,10 +100,11 @@ void SplitDataPlane::ConfigureRouting() {
 
   SPDLOG_INFO(
       "split routing policy: {} direct, {} reject, {} drop, {} resolvers; "
-      "default fptn",
+      "default fptn; source {}",
       config_.routing.direct_domains.size(),
       config_.routing.reject_domains.size(),
-      config_.routing.drop_domains.size(), resolvers.size());
+      config_.routing.drop_domains.size(), resolvers.size(),
+      configured_policy_ ? "injected" : "static");
 }
 
 std::expected<void, TunnelError> SplitDataPlane::Start() {

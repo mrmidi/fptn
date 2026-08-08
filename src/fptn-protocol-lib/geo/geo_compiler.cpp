@@ -54,6 +54,33 @@ std::uint8_t LabelCount(const std::string& value) {
   return static_cast<std::uint8_t>(std::min<std::size_t>(count, 255));
 }
 
+// Precedence when two groups claim the same name with different verdicts.
+//
+// Higher wins, and the ordering is "the rule that asks for special handling
+// beats the rule that says this is fine as-is". A name listed as blocked was
+// listed deliberately; a name listed as needing the tunnel is usually there
+// because it is geo-blocked, and answering `direct` would break it outright,
+// whereas the reverse merely costs some server traffic.
+//
+// The alternative -- first rule wins -- makes routing depend on the order the
+// groups happen to appear in the published file, which is not a decision
+// anybody made.
+std::uint8_t ActionRank(std::uint8_t action) {
+  switch (static_cast<GeoAction>(action)) {
+    case GeoAction::drop:
+      return 4;
+    case GeoAction::reject:
+      return 3;
+    case GeoAction::fptn:
+      return 2;
+    case GeoAction::direct:
+      return 1;
+    case GeoAction::none:
+      break;
+  }
+  return 0;
+}
+
 // One boundary in the IPv4 sweep.
 struct Event {
   std::uint64_t position = 0;  // 64-bit so end+1 of 255.255.255.255 fits
@@ -206,10 +233,14 @@ GeoCompileResult GeoCompiler::Compile(
     }
     if (found->second.action != action) {
       ++result.stats.domain_conflicts;
+      if (ActionRank(action) > ActionRank(found->second.action)) {
+        found->second.action = action;
+      }
     }
-    if (found->second.kind == GeoDomainKind::exact &&
-        input.kind == GeoDomainKind::suffix) {
-      found->second = DomainEntry{GeoDomainKind::suffix, action};
+    // Kind is resolved independently of the verdict: a suffix rule subsumes an
+    // exact rule for the same name, whichever of them won the verdict.
+    if (input.kind == GeoDomainKind::suffix) {
+      found->second.kind = GeoDomainKind::suffix;
     }
   }
   result.stats.domain_rules_out = static_cast<std::uint32_t>(domains.size());

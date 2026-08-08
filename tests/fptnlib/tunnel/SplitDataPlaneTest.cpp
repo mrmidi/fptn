@@ -12,6 +12,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 #include <cstring>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -28,6 +29,13 @@ using namespace fptn::tunnel::flow::testing;
 constexpr const char* kAppIp = "10.8.0.2";
 constexpr std::uint16_t kAppPort = 50000;
 constexpr std::uint32_t kClientIss = 0x40000001;
+
+class AlwaysDirectPolicy final : public IRoutingPolicy {
+ public:
+  RouteAction Decide(const FlowMetadata&, std::string_view) const override {
+    return RouteAction::direct;
+  }
+};
 
 void PushBe16(std::vector<std::uint8_t>& out, std::uint16_t value) {
   out.push_back(static_cast<std::uint8_t>(value >> 8));
@@ -109,7 +117,8 @@ bool PollUntil(Predicate predicate,
 
 class SplitDataPlaneTest : public ::testing::Test {
  protected:
-  void Build(const TunnelRoutingConfiguration& routing) {
+  void Build(const TunnelRoutingConfiguration& routing,
+      std::shared_ptr<const IRoutingPolicy> routing_policy = nullptr) {
     TunnelConfiguration config;
     config.mode = DataPlaneMode::split;
     config.l3.server_ip = "127.0.0.1";
@@ -128,7 +137,7 @@ class SplitDataPlaneTest : public ::testing::Test {
     // No transport is connected in these tests, so fptn-verdict packets are
     // refused rather than sent. That is exactly what exercises the rollback.
     plane_ = std::make_unique<SplitDataPlane>(config, callbacks_,
-        [this] { return transport_; });
+        [this] { return transport_; }, std::move(routing_policy));
     ASSERT_TRUE(plane_->Start().has_value());
   }
 
@@ -241,6 +250,18 @@ TEST_F(SplitDataPlaneTest, DirectVerdictReachesTheStackAndAnswers) {
         return false;
       },
       std::chrono::seconds(5)));
+}
+
+TEST_F(SplitDataPlaneTest, InjectedPolicyOverridesStaticDomainLists) {
+  TunnelRoutingConfiguration routing;
+  routing.reject_domains = {"would-have-been-rejected.example"};
+  Build(routing, std::make_shared<AlwaysDirectPolicy>());
+
+  const auto syn = MakeTcpV4(
+      kAppIp, "203.0.113.7", kAppPort, 443, kClientIss, 0, kFlagSyn);
+  ASSERT_EQ(Inject(syn), PacketInputResult::accepted);
+  EXPECT_EQ(plane_->SplitStatistics().packets_to_stack, 1u);
+  EXPECT_EQ(plane_->SplitStatistics().packets_to_transport, 0u);
 }
 
 // A mixed batch is the case the ownership contract is about.

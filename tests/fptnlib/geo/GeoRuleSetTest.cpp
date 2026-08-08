@@ -317,6 +317,50 @@ TEST(GeoRuleSetTest, ReportsConflictingDomainVerdicts) {
   EXPECT_EQ(result.stats.domain_conflicts, 1u);
 }
 
+// Two groups genuinely disagree about a handful of names in the published
+// lists (`epicgames.com` is in both EPICGAMES and CATEGORY-GEOBLOCK-RU). The
+// winner must not depend on which group the file happens to list first.
+TEST(GeoRuleSetTest, ConflictingVerdictsResolveByPrecedenceNotInputOrder) {
+  const auto compile = [](GeoAction first, GeoAction second) {
+    GeoCompileInputs inputs;
+    inputs.domains.push_back(Suffix("example.com", first));
+    inputs.domains.push_back(Suffix("example.com", second));
+    const auto bytes = CompileOrDie(inputs);
+    TempArtifact artifact(bytes);
+    GeoRuleSet rules;
+    EXPECT_EQ(rules.Open(artifact.path()), GeoLoadError::none);
+    return rules.LookupDomain("example.com");
+  };
+
+  // Tunnelling beats direct: a geo-blocked name answered `direct` is broken,
+  // while the reverse only costs server traffic.
+  EXPECT_EQ(compile(GeoAction::direct, GeoAction::fptn), GeoAction::fptn);
+  EXPECT_EQ(compile(GeoAction::fptn, GeoAction::direct), GeoAction::fptn);
+
+  // An explicit block beats everything: it was listed on purpose.
+  EXPECT_EQ(compile(GeoAction::fptn, GeoAction::drop), GeoAction::drop);
+  EXPECT_EQ(compile(GeoAction::drop, GeoAction::fptn), GeoAction::drop);
+  EXPECT_EQ(compile(GeoAction::direct, GeoAction::reject), GeoAction::reject);
+  EXPECT_EQ(compile(GeoAction::reject, GeoAction::direct), GeoAction::reject);
+}
+
+// Kind and verdict are resolved independently: a suffix rule subsumes an exact
+// one for the same name, whichever of the two won the verdict.
+TEST(GeoRuleSetTest, ASuffixRuleSubsumesAnExactRuleForTheSameName) {
+  GeoCompileInputs inputs;
+  inputs.domains.push_back(GeoDomainInput{
+      GeoDomainKind::exact, "example.com", GeoAction::direct});
+  inputs.domains.push_back(Suffix("example.com", GeoAction::direct));
+
+  const auto bytes = CompileOrDie(inputs);
+  TempArtifact artifact(bytes);
+  GeoRuleSet rules;
+  ASSERT_EQ(rules.Open(artifact.path()), GeoLoadError::none);
+
+  EXPECT_EQ(rules.LookupDomain("example.com"), GeoAction::direct);
+  EXPECT_EQ(rules.LookupDomain("www.example.com"), GeoAction::direct);
+}
+
 // ── Refusing bad artifacts ─────────────────────────────────────────────────
 //
 // This runs in the process that routes packets. Every one of these must be a

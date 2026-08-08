@@ -140,6 +140,12 @@ set(FPTN_CLIENT_PROTOCOL_SOURCES
     geo/geo_format.h
     geo/geo_compiler.h
     geo/geo_compiler.cpp
+    geo/geo_dat_parser.h
+    geo/geo_dat_parser.cpp
+    geo/geo_inputs.h
+    geo/geo_inputs.cpp
+    geo/geo_routing_policy.h
+    geo/geo_routing_policy.cpp
     geo/geo_rule_set.h
     geo/geo_rule_set.cpp
     tunnel/tunnel_configuration.h

@@ -51,6 +51,16 @@ add_executable(GeoRuleSetTest geo/GeoRuleSetTest.cpp)
 target_link_libraries(GeoRuleSetTest PRIVATE ${LIBS})
 add_test(NAME GeoRuleSetTest COMMAND GeoRuleSetTest)
 
+# The .dat container reader, the verdict map and the regex reducer.
+add_executable(GeoDatParserTest geo/GeoDatParserTest.cpp)
+target_link_libraries(GeoDatParserTest PRIVATE ${LIBS})
+add_test(NAME GeoDatParserTest COMMAND GeoDatParserTest)
+
+# Domain-first, address-fallback routing over a compiled rule set.
+add_executable(GeoRoutingPolicyTest geo/GeoRoutingPolicyTest.cpp)
+target_link_libraries(GeoRoutingPolicyTest PRIVATE ${LIBS})
+add_test(NAME GeoRoutingPolicyTest COMMAND GeoRoutingPolicyTest)
+
 # R2: 5-tuple peek, flow table and pinned classifier rules.
 add_executable(FlowClassifierTest tunnel/FlowClassifierTest.cpp)
 target_link_libraries(FlowClassifierTest PRIVATE ${LIBS})

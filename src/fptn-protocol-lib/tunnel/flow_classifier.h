@@ -159,4 +159,8 @@ class FlowClassifier {
 // Converts the boost address carried in FlowMetadata into the table key.
 IpKey ToIpKey(const boost::asio::ip::address& address) noexcept;
 
+// The inverse, for handing a decision back to a policy that matches on the
+// address itself. An unset key yields an unspecified v4 address.
+boost::asio::ip::address FromIpKey(const IpKey& key) noexcept;
+
 }  // namespace fptn::tunnel
