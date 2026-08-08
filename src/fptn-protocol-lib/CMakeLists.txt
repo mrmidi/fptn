@@ -137,6 +137,11 @@ set(FPTN_CLIENT_PROTOCOL_SOURCES
     tunnel/packet_types.h
     tunnel/routing_policy.h
     tunnel/routing_policy.cpp
+    geo/geo_format.h
+    geo/geo_compiler.h
+    geo/geo_compiler.cpp
+    geo/geo_rule_set.h
+    geo/geo_rule_set.cpp
     tunnel/tunnel_configuration.h
     tunnel/websocket_batch.h
     tunnel/websocket_batch.cpp

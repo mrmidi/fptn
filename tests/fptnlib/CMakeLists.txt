@@ -45,6 +45,12 @@ add_executable(RoutingPolicyTest tunnel/RoutingPolicyTest.cpp)
 target_link_libraries(RoutingPolicyTest PRIVATE ${LIBS})
 add_test(NAME RoutingPolicyTest COMMAND RoutingPolicyTest)
 
+# Compiled geo rule set: interval flattening, the mapped reader, and its
+# refusal to touch a malformed artifact.
+add_executable(GeoRuleSetTest geo/GeoRuleSetTest.cpp)
+target_link_libraries(GeoRuleSetTest PRIVATE ${LIBS})
+add_test(NAME GeoRuleSetTest COMMAND GeoRuleSetTest)
+
 # R2: 5-tuple peek, flow table and pinned classifier rules.
 add_executable(FlowClassifierTest tunnel/FlowClassifierTest.cpp)
 target_link_libraries(FlowClassifierTest PRIVATE ${LIBS})
