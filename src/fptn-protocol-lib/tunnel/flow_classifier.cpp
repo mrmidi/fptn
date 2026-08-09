@@ -12,10 +12,6 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 #include <utility>
 #include <vector>
 
-#include <arpa/inet.h>
-
-#include <spdlog/spdlog.h>
-
 namespace fptn::tunnel {
 
 namespace {
@@ -44,15 +40,6 @@ std::size_t HashAddress(const IpKey& key) noexcept {
     hash *= 1099511628211ULL;
   }
   return hash;
-}
-
-std::string FormatAddress(const IpKey& key) {
-  char buffer[INET6_ADDRSTRLEN] = {};
-  const int family = key.version == 6 ? AF_INET6 : AF_INET;
-  if (::inet_ntop(family, key.bytes.data(), buffer, sizeof(buffer)) == nullptr) {
-    return "?";
-  }
-  return buffer;
 }
 
 }  // namespace
@@ -217,14 +204,7 @@ RouteAction FlowClassifier::Classify(const PacketLease& lease) noexcept {
   const RouteAction action =
       DecideLocked(tuple, tuple.destination, tuple.destination_port);
   ++counters_.decisions;
-
-  // One line per flow, not per packet: this fires only on the first packet of
-  // a tuple, so it stays readable under load while still recording why every
-  // flow went where it did.
-  SPDLOG_INFO("route {} {}:{} -> {} [{}]",
-      tuple.protocol == TransportProtocol::tcp ? "tcp" : "udp",
-      FormatAddress(tuple.destination), tuple.destination_port,
-      ToString(action), last_decision_reason_);
+  CountVerdictLocked(action);
 
   if (flows_.size() >= config_.max_flows) {
     // Bounded by construction: the verdict is still correct, it just costs a
@@ -237,18 +217,33 @@ RouteAction FlowClassifier::Classify(const PacketLease& lease) noexcept {
   return action;
 }
 
+void FlowClassifier::CountVerdictLocked(RouteAction action) noexcept {
+  switch (action) {
+    case RouteAction::direct:
+      ++counters_.direct_flows;
+      break;
+    case RouteAction::fptn_l4:
+      ++counters_.fptn_flows;
+      break;
+    case RouteAction::reject:
+      ++counters_.rejected_flows;
+      break;
+    case RouteAction::drop:
+      ++counters_.dropped_flows;
+      break;
+  }
+}
+
 RouteAction FlowClassifier::DecideLocked(const FiveTuple& tuple,
     const IpKey& destination, std::uint16_t destination_port) {
   // Pinned rule 1: never tunnel the transport's own traffic.
   if (server_address_.has_value() && destination == *server_address_ &&
       (server_port_ == 0 || destination_port == server_port_)) {
-    last_decision_reason_ = "pinned:server";
     return RouteAction::direct;
   }
   // Pinned rule 2: the advertised resolvers live behind the tunnel.
   if (std::find(tunnel_resolvers_.begin(), tunnel_resolvers_.end(),
           destination) != tunnel_resolvers_.end()) {
-    last_decision_reason_ = "pinned:resolver";
     return RouteAction::fptn_l4;
   }
 
@@ -263,8 +258,6 @@ RouteAction FlowClassifier::DecideLocked(const FiveTuple& tuple,
   metadata.source.port = tuple.source_port;
 
   const std::string domain = attribution_.LookupDomain(destination);
-  last_decision_reason_ =
-      domain.empty() ? std::string("no-domain") : "domain=" + domain;
   return policy_.Decide(metadata, domain);
 }
 

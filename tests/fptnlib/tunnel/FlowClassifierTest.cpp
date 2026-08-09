@@ -261,6 +261,57 @@ TEST_F(FlowClassifierTest, VerdictIsDecidedOncePerFlow) {
   EXPECT_EQ(classifier->Counters().table_hits, 5u);
 }
 
+TEST_F(FlowClassifierTest, VerdictTallyCountsFlowsNotPackets) {
+  attribution_.Set(V4(104, 21, 0, 1), "2ip.ru");
+  attribution_.Set(V4(104, 21, 0, 2), "mail.ru");
+  attribution_.Set(V4(104, 21, 0, 3), "ads.example");
+  auto classifier = Make();
+
+  // One flow per verdict, each seen several times: the tally must follow the
+  // decision, not the packet, or it would just restate the packet counters.
+  const auto direct = MakeV4(V4(10, 8, 0, 2), V4(104, 21, 0, 1), 1000, 443);
+  const auto reject = MakeV4(V4(10, 8, 0, 2), V4(104, 21, 0, 2), 1001, 443);
+  const auto drop = MakeV4(V4(10, 8, 0, 2), V4(104, 21, 0, 3), 1002, 443);
+  const auto fptn = MakeV4(V4(10, 8, 0, 2), V4(93, 184, 216, 34), 1003, 443);
+
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_EQ(classifier->Classify(LeaseOf(direct)), RouteAction::direct);
+    EXPECT_EQ(classifier->Classify(LeaseOf(reject)), RouteAction::reject);
+    EXPECT_EQ(classifier->Classify(LeaseOf(drop)), RouteAction::drop);
+    EXPECT_EQ(classifier->Classify(LeaseOf(fptn)), RouteAction::fptn_l4);
+  }
+
+  const auto counters = classifier->Counters();
+  EXPECT_EQ(counters.direct_flows, 1u);
+  EXPECT_EQ(counters.rejected_flows, 1u);
+  EXPECT_EQ(counters.dropped_flows, 1u);
+  EXPECT_EQ(counters.fptn_flows, 1u);
+  // The invariant the funnel line is read against: the four partition
+  // `decisions`, so a nonzero remainder means a verdict went uncounted.
+  EXPECT_EQ(counters.direct_flows + counters.rejected_flows +
+                counters.dropped_flows + counters.fptn_flows,
+      counters.decisions);
+  EXPECT_EQ(counters.classified_packets, 12u);
+}
+
+TEST_F(FlowClassifierTest, VerdictTallyCountsThePinnedRules) {
+  auto classifier = Make();
+  classifier->SetServerEndpoint(V4(85, 155, 124, 43), 443);
+  classifier->SetTunnelResolvers({V4(10, 8, 0, 1)});
+
+  const auto server = MakeV4(V4(10, 8, 0, 2), V4(85, 155, 124, 43), 1000, 443);
+  const auto resolver = MakeV4(V4(10, 8, 0, 2), V4(10, 8, 0, 1), 1001, 53, 17);
+  EXPECT_EQ(classifier->Classify(LeaseOf(server)), RouteAction::direct);
+  EXPECT_EQ(classifier->Classify(LeaseOf(resolver)), RouteAction::fptn_l4);
+
+  // The pinned rules return before the policy is consulted, so they are the
+  // easy ones to leave out of the tally and break the sum invariant.
+  const auto counters = classifier->Counters();
+  EXPECT_EQ(counters.direct_flows, 1u);
+  EXPECT_EQ(counters.fptn_flows, 1u);
+  EXPECT_EQ(counters.decisions, 2u);
+}
+
 TEST_F(FlowClassifierTest, DistinctFlowsAreKeyedSeparately) {
   attribution_.Set(V4(104, 21, 0, 1), "2ip.ru");
   auto classifier = Make();

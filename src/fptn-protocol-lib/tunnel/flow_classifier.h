@@ -88,6 +88,16 @@ struct ClassifierCounters {
   std::uint64_t table_full_events = 0;
   std::uint64_t expired_flows = 0;
   std::uint64_t active_flows = 0;
+
+  // Verdict tally, one increment per new flow rather than per packet, so the
+  // sum of the four equals `decisions`. This answers "is the policy actually
+  // routing anything, and which way" — the question per-flow log lines were
+  // meant to answer and could not, being both unreadable under load and a
+  // record of every destination the person visited.
+  std::uint64_t direct_flows = 0;
+  std::uint64_t fptn_flows = 0;
+  std::uint64_t rejected_flows = 0;
+  std::uint64_t dropped_flows = 0;
 };
 
 // Decides one verdict per flow, at packet ingress, before anything reaches the
@@ -134,6 +144,9 @@ class FlowClassifier {
   RouteAction DecideLocked(const FiveTuple& tuple, const IpKey& destination,
       std::uint16_t destination_port);
 
+  // Requires mutex_.
+  void CountVerdictLocked(RouteAction action) noexcept;
+
   ClassifierConfiguration config_;
   const IRoutingPolicy& policy_;
   const IDomainAttribution& attribution_;
@@ -143,10 +156,6 @@ class FlowClassifier {
   std::optional<IpKey> server_address_;
   std::uint16_t server_port_ = 0;
   std::vector<IpKey> tunnel_resolvers_;
-
-  // Why the last decision went the way it did, for the log line that follows
-  // it. Written and read under mutex_, like the table itself.
-  std::string last_decision_reason_;
 
   // Packets seen since the last idle sweep; the sweep is amortised onto the
   // ingress path so no timer thread has to touch the table.

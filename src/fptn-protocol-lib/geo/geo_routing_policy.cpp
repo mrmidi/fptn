@@ -9,8 +9,6 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 #include <array>
 #include <utility>
 
-#include <spdlog/spdlog.h>
-
 namespace fptn::geo {
 
 namespace {
@@ -88,22 +86,13 @@ RouteAction GeoRoutingPolicy::Decide(
     return fallback_;
   }
 
-  // Which table answered, for the log line. Debugging a routing complaint is
-  // almost always "why did THIS go there", and the verdict alone does not say.
-  const char* matched = "default";
   GeoAction action = GeoAction::none;
 
   if (!domain.empty()) {
     action = rules_->LookupDomain(domain);
-    if (action != GeoAction::none) {
-      matched = "name";
-    }
   }
   if (action == GeoAction::none) {
     action = LookupAddress(flow.destination.address);
-    if (action != GeoAction::none) {
-      matched = "addr";
-    }
   }
   if (action == GeoAction::none) {
     // The artifact's own default, which is what the verdict map was compiled
@@ -111,17 +100,7 @@ RouteAction GeoRoutingPolicy::Decide(
     action = rules_->default_action();
   }
 
-  const RouteAction route = ToRouteAction(action, fallback_);
-
-  // Debug rather than info: this is one line per flow, but it is also a record
-  // of every destination the person visited. It compiles in and is filtered at
-  // runtime, so it can be turned on in a shipped build without a new binary.
-  SPDLOG_DEBUG("geo dest={} name={} -> {} [{}]",
-      flow.destination.address.to_string(),
-      domain.empty() ? std::string_view("-") : domain,
-      fptn::tunnel::ToString(route), matched);
-
-  return route;
+  return ToRouteAction(action, fallback_);
 }
 
 }  // namespace fptn::geo
