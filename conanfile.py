@@ -320,7 +320,14 @@ class FPTN(ConanFile):
             self.options["boost"].without_process = True
 
     def export(self):
-        copy(self, f"*", src=self.recipe_folder, dst=self.export_folder)
+        # Everything in the recipe folder except local build trees.
+        #
+        # The bare `*` this used to be copied those too, and they dwarf what is
+        # actually being exported: ~6.5 GB of build output against ~25 MB of
+        # sources, snapshotted again on every export. Twenty-nine snapshots had
+        # accumulated before it filled the disk.
+        copy(self, "*", src=self.recipe_folder, dst=self.export_folder,
+             excludes=("build/*", "build-*/*"))
 
     def _use_mimalloc(self):
         # mimalloc causes crashes on other platform
