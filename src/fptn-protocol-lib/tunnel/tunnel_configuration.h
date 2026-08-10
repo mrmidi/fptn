@@ -48,6 +48,15 @@ struct TunnelRoutingConfiguration {
   // traffic is pinned to the fptn verdict; this is what makes server-supplied
   // DNS work in split mode.
   std::vector<std::string> tunnel_resolvers;
+  // Resolvers the user chose themselves, pinned to `direct` so they are
+  // reached from this device's own network position.
+  //
+  // Pinned rather than left to the policy, because the policy would answer
+  // differently depending on which resolver was typed -- a Russian one lands
+  // in the geo direct set, a foreign one falls to the default and tunnels.
+  // Same setting, opposite behaviour. It also has to be pinned to work at all
+  // for a resolver on the local network, which the server cannot reach.
+  std::vector<std::string> direct_resolvers;
 };
 
 struct TunnelCallbacks {

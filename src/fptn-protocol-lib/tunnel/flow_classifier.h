@@ -119,6 +119,14 @@ class FlowClassifier {
   // through the tunnel, so their traffic is always `fptn`. This is what makes
   // server-supplied DNS work in split mode.
   void SetTunnelResolvers(const std::vector<IpKey>& resolvers);
+  // Pinned rule 3: a resolver the user chose is queried from this device's own
+  // network position, so its traffic is always `direct`.
+  //
+  // Ranked below rule 2 on purpose. The two lists are built to be disjoint, so
+  // an address in both means someone typed the server's own resolver into the
+  // custom field — and answering `direct` there would make it unreachable and
+  // take DNS down entirely, whereas `fptn` is simply what they already had.
+  void SetDirectResolvers(const std::vector<IpKey>& resolvers);
 
   // Per-packet entry point. Never allocates on the cached path.
   RouteAction Classify(const PacketLease& lease) noexcept;
@@ -156,6 +164,7 @@ class FlowClassifier {
   std::optional<IpKey> server_address_;
   std::uint16_t server_port_ = 0;
   std::vector<IpKey> tunnel_resolvers_;
+  std::vector<IpKey> direct_resolvers_;
 
   // Packets seen since the last idle sweep; the sweep is amortised onto the
   // ingress path so no timer thread has to touch the table.

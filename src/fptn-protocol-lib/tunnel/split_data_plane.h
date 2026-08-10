@@ -121,6 +121,10 @@ class SplitDataPlane final : public IDataPlane {
   // Builds the policy and pinned rules from config_.routing.
   void ConfigureRouting();
 
+  // Same read-only tap as ObserveInbound, on the stack's egress. A resolver
+  // pinned `direct` answers through here rather than through the transport.
+  void ObserveEgress(OwnedPacketBatchView batch) noexcept;
+
   TunnelConfiguration config_;
   TunnelCallbacks callbacks_;
 

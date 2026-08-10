@@ -244,6 +244,29 @@ TEST_F(FlowClassifierTest, ResolverTrafficAlwaysTunnels) {
   EXPECT_EQ(classifier->Classify(LeaseOf(dns)), RouteAction::fptn_l4);
 }
 
+TEST_F(FlowClassifierTest, AChosenResolverIsQueriedFromThisDevice) {
+  // The policy would tunnel this address, and a resolver on the local network
+  // is one the server could not reach at all.
+  auto classifier = Make();
+  classifier->SetDirectResolvers({V4(192, 168, 1, 10)});
+
+  const auto dns =
+      MakeV4(V4(10, 8, 0, 2), V4(192, 168, 1, 10), 40000, 53, 17);
+  EXPECT_EQ(classifier->Classify(LeaseOf(dns)), RouteAction::direct);
+}
+
+TEST_F(FlowClassifierTest, AResolverInBothListsStaysOnTheTunnel) {
+  // Only reachable if someone typed the server's own resolver into the custom
+  // field. Answering `direct` there would make it unreachable and take DNS
+  // down entirely, so the tunnel pin has to win.
+  auto classifier = Make();
+  classifier->SetTunnelResolvers({V4(10, 8, 0, 1)});
+  classifier->SetDirectResolvers({V4(10, 8, 0, 1)});
+
+  const auto dns = MakeV4(V4(10, 8, 0, 2), V4(10, 8, 0, 1), 40000, 53, 17);
+  EXPECT_EQ(classifier->Classify(LeaseOf(dns)), RouteAction::fptn_l4);
+}
+
 TEST_F(FlowClassifierTest, VerdictIsDecidedOncePerFlow) {
   attribution_.Set(V4(104, 21, 0, 1), "2ip.ru");
   auto classifier = Make();

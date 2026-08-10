@@ -96,6 +96,24 @@ void SplitDataPlane::ConfigureRouting() {
         config_.routing.tunnel_resolvers.size());
   }
 
+  std::vector<IpKey> direct_resolvers;
+  direct_resolvers.reserve(config_.routing.direct_resolvers.size());
+  for (const auto& text : config_.routing.direct_resolvers) {
+    if (const auto address = ParseAddress(text)) {
+      direct_resolvers.push_back(*address);
+    }
+  }
+  classifier_->SetDirectResolvers(direct_resolvers);
+  if (!direct_resolvers.empty()) {
+    SPDLOG_INFO("{} user-chosen resolver(s) pinned direct", direct_resolvers.size());
+  }
+  if (direct_resolvers.size() != config_.routing.direct_resolvers.size()) {
+    SPDLOG_WARN(
+        "{} of {} direct resolvers could not be parsed and are not pinned",
+        config_.routing.direct_resolvers.size() - direct_resolvers.size(),
+        config_.routing.direct_resolvers.size());
+  }
+
   router_ = std::make_unique<TableBackedRouter>(*classifier_);
 
   SPDLOG_INFO(
@@ -132,7 +150,17 @@ std::expected<void, TunnelError> SplitDataPlane::Start() {
   // transport NATs between them on the wire, so the assigned address never
   // appears on this interface.
   TunnelCallbacks flow_callbacks;
-  flow_callbacks.on_owned_packet_batch = callbacks_.on_owned_packet_batch;
+  // The stack's egress is the return path for every `direct` flow, so it is
+  // where a directly-resolved DNS answer appears. Without this tap, pinning a
+  // resolver direct would silently disable domain attribution -- and with it
+  // every domain rule in the compiled policy, leaving only the address tables.
+  flow_callbacks.on_owned_packet_batch =
+      [this](OwnedPacketBatchView batch) {
+        ObserveEgress(batch);
+        if (callbacks_.on_owned_packet_batch) {
+          callbacks_.on_owned_packet_batch(batch);
+        }
+      };
   flow_plane_ = std::make_unique<FlowProxyDataPlane>(
       config_, std::move(flow_callbacks), router_.get());
   if (auto result = flow_plane_->Start(); !result.has_value()) {
@@ -270,6 +298,15 @@ void SplitDataPlane::ObserveInbound(
     const fptn::common::network::BatchIPPacketPtr& packets) noexcept {
   if (dns_observer_) {
     dns_observer_->Observe(packets);
+  }
+}
+
+void SplitDataPlane::ObserveEgress(OwnedPacketBatchView batch) noexcept {
+  if (!dns_observer_) {
+    return;
+  }
+  for (const OwnedPacket& packet : batch) {
+    dns_observer_->ObservePacket(packet.data.data(), packet.data.size());
   }
 }
 

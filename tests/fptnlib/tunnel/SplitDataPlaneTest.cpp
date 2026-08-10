@@ -20,6 +20,7 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 #include "fptn-protocol-lib/tunnel/tunnel_engine.h"
 
 #include "../flow/flow_test_support.h"
+#include "../flow/posix_udp_echo_server.h"
 
 namespace {
 
@@ -250,6 +251,46 @@ TEST_F(SplitDataPlaneTest, DirectVerdictReachesTheStackAndAnswers) {
         return false;
       },
       std::chrono::seconds(5)));
+}
+
+// A resolver the user chose answers through the stack's egress rather than
+// through the transport, so the inbound tap the observer normally lives on
+// never sees it. Without the egress tap, pinning a resolver direct would
+// silently retire every domain rule in the policy and leave only the address
+// tables -- which is why the pin and the tap belong to the same change.
+TEST_F(SplitDataPlaneTest, AResolverPinnedDirectStillTeachesTheObserver) {
+  PosixUdpEchoServer server;
+  ASSERT_TRUE(server.Start());
+
+  TunnelRoutingConfiguration routing;
+  routing.direct_resolvers = {"127.0.0.1"};
+  Build(routing);
+
+  // The echo server returns what it is sent, so sending a well-formed answer
+  // is how a real one arrives back on the direct path. Skip the 20-byte IP and
+  // 8-byte UDP headers: only the DNS payload is echoed.
+  const auto answer =
+      MakeDnsResponseBytes("direct-resolver.test", 203, 0, 113, 9);
+  const std::vector<std::uint8_t> payload(answer.begin() + 28, answer.end());
+
+  // Port 53 on the query side rather than the reply side, because an echo
+  // server cannot bind 53 unprivileged. The observer's filter is symmetric
+  // (`src == 53 || dst == 53`), so the packet reaches the same parser a real
+  // answer would.
+  ASSERT_EQ(
+      Inject(MakeUdpV4(kAppIp, "127.0.0.1", 53, server.port(), payload)),
+      PacketInputResult::accepted);
+  // The pin took effect: no transport is connected, so anything else would
+  // have been refused rather than reaching the stack.
+  EXPECT_EQ(plane_->SplitStatistics().packets_to_stack, 1u);
+
+  IpKey resolved;
+  resolved.version = 4;
+  resolved.bytes = {203, 0, 113, 9};
+  EXPECT_TRUE(PollUntil([this, &resolved] {
+    return plane_->DnsObserverForTesting().LookupDomain(resolved) ==
+           "direct-resolver.test";
+  }));
 }
 
 TEST_F(SplitDataPlaneTest, InjectedPolicyOverridesStaticDomainLists) {

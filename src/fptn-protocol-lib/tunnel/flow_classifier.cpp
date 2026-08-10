@@ -159,6 +159,11 @@ void FlowClassifier::SetServerEndpoint(
   server_port_ = port;
 }
 
+void FlowClassifier::SetDirectResolvers(const std::vector<IpKey>& resolvers) {
+  std::lock_guard lock(mutex_);
+  direct_resolvers_ = resolvers;
+}
+
 void FlowClassifier::SetTunnelResolvers(const std::vector<IpKey>& resolvers) {
   std::lock_guard lock(mutex_);
   tunnel_resolvers_ = resolvers;
@@ -245,6 +250,12 @@ RouteAction FlowClassifier::DecideLocked(const FiveTuple& tuple,
   if (std::find(tunnel_resolvers_.begin(), tunnel_resolvers_.end(),
           destination) != tunnel_resolvers_.end()) {
     return RouteAction::fptn_l4;
+  }
+  // Pinned rule 3: a resolver the user chose is queried from here, not from
+  // the server. Checked after rule 2 -- see SetDirectResolvers.
+  if (std::find(direct_resolvers_.begin(), direct_resolvers_.end(),
+          destination) != direct_resolvers_.end()) {
+    return RouteAction::direct;
   }
 
   FlowMetadata metadata;
