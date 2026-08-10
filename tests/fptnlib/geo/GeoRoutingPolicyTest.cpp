@@ -303,6 +303,23 @@ TEST(GeoRoutingPolicyTest, TheClassifierKeyRoundTripsToAnAddress) {
 
 // ── the published lists, end to end ─────────────────────────────────────────
 
+std::vector<std::uint8_t> ReadFixture(const char* dir, const char* name) {
+  const std::string path = std::string(dir) + "/" + name;
+  std::vector<std::uint8_t> bytes;
+  std::FILE* file = std::fopen(path.c_str(), "rb");
+  if (file == nullptr) {
+    return bytes;
+  }
+  std::uint8_t buffer[65536];
+  std::size_t n = 0;
+  while ((n = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
+    bytes.insert(bytes.end(), buffer, buffer + n);
+  }
+  std::fclose(file);
+  return bytes;
+}
+
+
 // Opt-in, because the real lists live in the app repo rather than here:
 //
 //   FPTN_GEO_DAT_DIR=../../../../FptnVPNTests/Fixtures ./GeoRoutingPolicyTest
@@ -317,24 +334,8 @@ TEST(GeoRoutingPolicyPublishedTest, RoutesTheRealListsEndToEnd) {
     GTEST_SKIP() << "set FPTN_GEO_DAT_DIR to run against the published lists";
   }
 
-  const auto read = [dir](const char* name) {
-    const std::string path = std::string(dir) + "/" + name;
-    std::vector<std::uint8_t> bytes;
-    std::FILE* file = std::fopen(path.c_str(), "rb");
-    if (file == nullptr) {
-      return bytes;
-    }
-    std::uint8_t buffer[65536];
-    std::size_t n = 0;
-    while ((n = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
-      bytes.insert(bytes.end(), buffer, buffer + n);
-    }
-    std::fclose(file);
-    return bytes;
-  };
-
-  const auto geoip_bytes = read("geoip.dat");
-  const auto geosite_bytes = read("geosite.dat");
+  const auto geoip_bytes = ReadFixture(dir, "geoip.dat");
+  const auto geosite_bytes = ReadFixture(dir, "geosite.dat");
   ASSERT_FALSE(geoip_bytes.empty()) << "geoip.dat not found under " << dir;
   ASSERT_FALSE(geosite_bytes.empty()) << "geosite.dat not found under " << dir;
 
@@ -393,6 +394,110 @@ TEST(GeoRoutingPolicyPublishedTest, RoutesTheRealListsEndToEnd) {
 
   // An address with no name attributed to it, answered by the IPv4 table.
   EXPECT_EQ(policy.Decide(FlowTo("77.88.8.8"), ""), RouteAction::direct);
+}
+
+// Both published lists put APNs in the direct set, which is right on an
+// ordinary connection and fatal on a whitelist ISP: push dies silently while
+// every other part of the tunnel keeps working and looks healthy.
+//
+// Runs against the shipping lists on purpose. A hand-built fixture would prove
+// the override matches what it was written against, which is not the question
+// -- the question is whether it still matches what upstream publishes.
+TEST(GeoRoutingPolicyPublishedTest, MovesApplePushToTheServerOnRequest) {
+  const char* dir = std::getenv("FPTN_GEO_DAT_DIR");
+  if (dir == nullptr) {
+    GTEST_SKIP() << "set FPTN_GEO_DAT_DIR to run against the published lists";
+  }
+
+  const auto geoip_bytes = ReadFixture(dir, "geoip.dat");
+  const auto geosite_bytes = ReadFixture(dir, "geosite.dat");
+  ASSERT_FALSE(geoip_bytes.empty()) << "geoip.dat not found under " << dir;
+  ASSERT_FALSE(geosite_bytes.empty()) << "geosite.dat not found under " << dir;
+
+  const auto ip = fptn::geo::GeoDatParser::ParseGeoIp(geoip_bytes);
+  const auto site = fptn::geo::GeoDatParser::ParseGeoSite(geosite_bytes);
+  ASSERT_TRUE(ip.ok());
+  ASSERT_TRUE(site.ok());
+
+  struct Built {
+    std::vector<std::uint8_t> bytes;
+    std::uint32_t overridden = 0;
+    std::uint32_t verdict_map_id = 0;
+  };
+  const auto build = [&](bool push_via_fptn) {
+    const auto map = fptn::geo::DefaultVerdictMap(
+        fptn::geo::GeoIpProfile::standard, push_via_fptn);
+    const auto built =
+        fptn::geo::BuildGeoInputs(ip.groups, site.groups, map);
+    GeoCompileOptions options;
+    options.default_action = GeoAction::fptn;
+    options.bare_hostname_is_direct = built.report.bare_hostname_is_direct;
+    options.verdict_map_id = map.id();
+    const auto compiled = GeoCompiler::Compile(built.inputs, options);
+    EXPECT_TRUE(compiled.ok) << compiled.error;
+    return Built{compiled.bytes, built.report.apple_push_rules_overridden,
+        map.id()};
+  };
+
+  const Built plain = build(false);
+  const Built pushed = build(true);
+
+  std::printf(
+      "[geo] apple push override displaced %u published rules; artifact "
+      "%zu -> %zu bytes\n",
+      pushed.overridden, plain.bytes.size(), pushed.bytes.size());
+
+  EXPECT_EQ(plain.overridden, 0u);
+  EXPECT_GT(pushed.overridden, 0u)
+      << "the override displaced nothing: upstream may have moved APNs out of "
+         "the direct set, which would make this dead code";
+  // The two settings must not produce artifacts that claim to be the same
+  // thing, or a stale one would look current after the switch is flipped.
+  EXPECT_NE(plain.verdict_map_id, pushed.verdict_map_id);
+
+  const TempArtifact plain_artifact(plain.bytes);
+  const auto plain_rules = std::make_shared<GeoRuleSet>();
+  ASSERT_EQ(plain_rules->Open(plain_artifact.path()),
+      fptn::geo::GeoLoadError::none);
+  const GeoRoutingPolicy push_direct(plain_rules, RouteAction::fptn_l4);
+
+  const TempArtifact pushed_artifact(pushed.bytes);
+  const auto pushed_rules = std::make_shared<GeoRuleSet>();
+  ASSERT_EQ(pushed_rules->Open(pushed_artifact.path()),
+      fptn::geo::GeoLoadError::none);
+  const GeoRoutingPolicy push_tunnelled(pushed_rules, RouteAction::fptn_l4);
+
+  // Off: the couriers go direct, by address and by name. This is the reported
+  // failure, reproduced.
+  EXPECT_EQ(push_direct.Decide(FlowTo("17.249.10.10"), ""),
+      RouteAction::direct);
+  EXPECT_EQ(push_direct.Decide(FlowTo("2620:149:a44::10"), ""),
+      RouteAction::direct);
+  EXPECT_EQ(
+      push_direct.Decide(FlowTo("17.249.10.10"), "1-courier.push.apple.com"),
+      RouteAction::direct);
+
+  // On: they tunnel. By name as well as by address, because the address rules
+  // only apply once a connection is being made, and the published courier
+  // addresses change without the name ever doing so.
+  EXPECT_EQ(push_tunnelled.Decide(FlowTo("17.249.10.10"), ""),
+      RouteAction::fptn_l4);
+  EXPECT_EQ(push_tunnelled.Decide(FlowTo("17.57.145.1"), ""),
+      RouteAction::fptn_l4);
+  EXPECT_EQ(push_tunnelled.Decide(FlowTo("2620:149:a44::10"), ""),
+      RouteAction::fptn_l4);
+  EXPECT_EQ(
+      push_tunnelled.Decide(FlowTo("1.1.1.1"), "1-courier.push.apple.com"),
+      RouteAction::fptn_l4);
+
+  // Nothing else about Apple moves either way. Updates and iCloud are bulk
+  // transfers with every reason to stay off the server.
+  for (const GeoRoutingPolicy* policy : {&push_direct, &push_tunnelled}) {
+    EXPECT_EQ(policy->Decide(FlowTo("17.72.70.5"), ""), RouteAction::direct);
+    EXPECT_EQ(policy->Decide(FlowTo("17.253.144.10"), "gs.apple.com"),
+        RouteAction::direct);
+    EXPECT_EQ(policy->Decide(FlowTo("192.168.1.1"), ""), RouteAction::direct);
+  }
 }
 
 }  // namespace

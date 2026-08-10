@@ -476,6 +476,10 @@ GeoAction GeoRuleSet::default_action() const noexcept {
                             : static_cast<GeoAction>(header_->default_action);
 }
 
+std::uint32_t GeoRuleSet::verdict_map_id() const noexcept {
+  return header_ == nullptr ? 0 : header_->verdict_map_id;
+}
+
 std::uint32_t GeoRuleSet::ipv4_count() const noexcept {
   return header_ == nullptr ? 0 : header_->ipv4_count;
 }

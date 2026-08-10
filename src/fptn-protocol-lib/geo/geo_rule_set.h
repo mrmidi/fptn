@@ -87,6 +87,13 @@ class GeoRuleSet {
 
   GeoAction default_action() const noexcept;
 
+  // Which verdict map produced this artifact -- the mapping version plus the
+  // routing preferences it was compiled under. Comparing it against what the
+  // compiler would produce now is how a caller tells a policy built under
+  // different settings from a current one, with no download involved. 0 when
+  // nothing is open.
+  std::uint32_t verdict_map_id() const noexcept;
+
   std::uint32_t ipv4_count() const noexcept;
   std::uint32_t ipv6_count() const noexcept;
   std::uint32_t domain_count() const noexcept;

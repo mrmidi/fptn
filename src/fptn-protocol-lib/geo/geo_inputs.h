@@ -42,10 +42,20 @@ enum class GeoIpProfile : std::uint8_t {
 // Bumped when the built-in mapping below changes. It reaches the artifact
 // header as part of `verdict_map_id`, so a mapping change forces a recompile
 // even when the source files are byte-identical.
-inline constexpr std::uint32_t kVerdictMapVersion = 1;
+inline constexpr std::uint32_t kVerdictMapVersion = 2;
 
 struct GeoVerdictMap {
   GeoIpProfile ip_profile = GeoIpProfile::standard;
+
+  // Sends Apple's push couriers to the server instead of direct.
+  //
+  // Both published lists put APNs in the direct set, which is right on an
+  // ordinary connection and wrong on a whitelist ISP: leaving push direct on a
+  // network that does not permit 17.0.0.0/8 kills notifications silently, while
+  // every other part of the tunnel keeps working and looks healthy. The user
+  // already answers this question in Settings, so it is a compile-time input
+  // rather than a guess.
+  bool apple_push_via_fptn = false;
 
   // Verdict when nothing matches at all.
   GeoAction default_action = GeoAction::fptn;
@@ -61,8 +71,13 @@ struct GeoVerdictMap {
   GeoAction unmapped_site = GeoAction::fptn;
   GeoAction unmapped_ip = GeoAction::none;
 
+  // Every input that changes the output, packed into the artifact header so a
+  // reader can tell which opinion it is routing on. The profile is bit 0 and
+  // the push override bit 1, both below the version in the high bytes.
   std::uint32_t id() const noexcept {
-    return (kVerdictMapVersion << 8) | static_cast<std::uint32_t>(ip_profile);
+    return (kVerdictMapVersion << 8) |
+           static_cast<std::uint32_t>(ip_profile) |
+           (apple_push_via_fptn ? 0x2u : 0x0u);
   }
 };
 
@@ -74,7 +89,26 @@ struct GeoVerdictMap {
 // waste server traffic) through a proxy, TORRENT is blocked to spare the server
 // and its host, and TWITCH-ADS is proxied rather than blocked because tunnelling
 // it is what restores Source quality.
-GeoVerdictMap DefaultVerdictMap(GeoIpProfile profile = GeoIpProfile::standard);
+GeoVerdictMap DefaultVerdictMap(GeoIpProfile profile = GeoIpProfile::standard,
+    bool apple_push_via_fptn = false);
+
+// Apple's push couriers, as Apple documents them for networks that filter
+// outbound traffic. Exposed so tests can assert against the same list the
+// override applies rather than a copy of it that could drift.
+struct GeoPushRange {
+  bool is_ipv6 = false;
+  std::uint64_t high = 0;
+  std::uint64_t low = 0;
+  std::uint8_t prefix = 0;
+};
+
+// Deliberately not the whole APPLE group: software updates and iCloud are bulk
+// transfers with every reason to stay off the server. Only the couriers move.
+const std::vector<GeoPushRange>& ApplePushRanges();
+
+// The one name that has to follow the addresses. `*-courier.push.apple.com` is
+// what a device actually connects to, and it is a subdomain of this.
+inline constexpr std::string_view kApplePushDomain = "push.apple.com";
 
 // What a regex was reduced to.
 enum class GeoRegexOutcome : std::uint8_t {
@@ -117,6 +151,12 @@ struct GeoInputsReport {
   // where every unmatched address goes.
   std::vector<std::string> inverted_groups;
   bool bare_hostname_is_direct = false;
+  // Group rules the Apple-push override displaced. Always zero while the
+  // override is off. Zero while it is ON is the interesting case: it means the
+  // published lists no longer send push direct and the override has quietly
+  // become a no-op, which is worth noticing before someone assumes it is still
+  // doing something.
+  std::uint32_t apple_push_rules_overridden = 0;
 };
 
 struct GeoInputsResult {

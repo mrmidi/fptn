@@ -6,7 +6,11 @@ Distributed under the MIT License (https://opensource.org/licenses/MIT)
 
 #include "fptn-protocol-lib/geo/geo_inputs.h"
 
+#include <algorithm>
+#include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 namespace fptn::geo {
 
@@ -66,11 +70,91 @@ bool IsAsciiAlnum(char c) {
          (c >= 'A' && c <= 'Z');
 }
 
+std::string ToLowerAscii(std::string_view in) {
+  std::string out(in);
+  for (char& c : out) {
+    if (c >= 'A' && c <= 'Z') {
+      c = static_cast<char>(c - 'A' + 'a');
+    }
+  }
+  return out;
+}
+
+// Whether `inner` lies entirely within `outer`. Both are CIDRs, so this is
+// "at least as specific, and agreeing on the outer prefix" -- no need to
+// materialise either range.
+bool IsInside(const GeoPushRange& outer, bool is_ipv6, std::uint64_t high,
+    std::uint64_t low, std::uint8_t prefix) {
+  if (is_ipv6 != outer.is_ipv6 || prefix < outer.prefix) {
+    return false;
+  }
+  if (!outer.is_ipv6) {
+    const std::uint32_t mask =
+        (outer.prefix == 0) ? 0u : (~0u << (32 - outer.prefix));
+    return (static_cast<std::uint32_t>(low) & mask) ==
+           (static_cast<std::uint32_t>(outer.low) & mask);
+  }
+  std::uint64_t high_mask = 0;
+  std::uint64_t low_mask = 0;
+  if (outer.prefix >= 64) {
+    high_mask = ~0ULL;
+    low_mask = (outer.prefix == 64) ? 0ULL : (~0ULL << (128 - outer.prefix));
+  } else if (outer.prefix != 0) {
+    high_mask = ~0ULL << (64 - outer.prefix);
+  }
+  return (high & high_mask) == (outer.high & high_mask) &&
+         (low & low_mask) == (outer.low & low_mask);
+}
+
+bool IsInsideApplePush(bool is_ipv6, std::uint64_t high, std::uint64_t low,
+    std::uint8_t prefix) {
+  const std::vector<GeoPushRange>& ranges = ApplePushRanges();
+  return std::any_of(ranges.begin(), ranges.end(),
+      [&](const GeoPushRange& range) {
+        return IsInside(range, is_ipv6, high, low, prefix);
+      });
+}
+
+// True for the push name itself and anything under it, which is what a suffix
+// rule for `push.apple.com` already covers.
+bool IsUnderApplePushDomain(std::string_view value) {
+  const std::string lowered = ToLowerAscii(value);
+  if (lowered == kApplePushDomain) {
+    return true;
+  }
+  return lowered.size() > kApplePushDomain.size() + 1 &&
+         lowered.compare(lowered.size() - kApplePushDomain.size(),
+             kApplePushDomain.size(), kApplePushDomain) == 0 &&
+         lowered[lowered.size() - kApplePushDomain.size() - 1] == '.';
+}
+
 }  // namespace
 
-GeoVerdictMap DefaultVerdictMap(GeoIpProfile profile) {
+const std::vector<GeoPushRange>& ApplePushRanges() {
+  // Apple's published APNs ranges. Every one of them is also inside the
+  // roscomvpn DIRECT set, which is precisely why the override has to exist:
+  // matching them here and moving them to `fptn` is what keeps notifications
+  // alive on a network that only permits what it has been told to.
+  static const std::vector<GeoPushRange> ranges = {
+      {false, 0, 0x11399000ULL, 22},   // 17.57.144.0/22
+      {false, 0, 0x11BC1400ULL, 23},   // 17.188.20.0/23
+      {false, 0, 0x11BC8000ULL, 18},   // 17.188.128.0/18
+      {false, 0, 0x11F90000ULL, 16},   // 17.249.0.0/16
+      {false, 0, 0x11FC0000ULL, 16},   // 17.252.0.0/16
+      {true, 0x240303000A420000ULL, 0, 48},  // 2403:300:a42::/48
+      {true, 0x240303000A510000ULL, 0, 48},  // 2403:300:a51::/48
+      {true, 0x262001490A420000ULL, 0, 48},  // 2620:149:a42::/48
+      {true, 0x262001490A440000ULL, 0, 48},  // 2620:149:a44::/48
+      {true, 0x2A01B7400A420000ULL, 0, 48},  // 2a01:b740:a42::/48
+  };
+  return ranges;
+}
+
+GeoVerdictMap DefaultVerdictMap(
+    GeoIpProfile profile, bool apple_push_via_fptn) {
   GeoVerdictMap map;
   map.ip_profile = profile;
+  map.apple_push_via_fptn = apple_push_via_fptn;
   map.default_action = GeoAction::fptn;
 
   // RFC1918 and friends must never be tunnelled, under either profile.
@@ -251,6 +335,16 @@ GeoInputsResult BuildGeoInputs(const std::vector<GeoDatIpGroup>& ip_groups,
     }
     ++result.report.ip_groups_used;
     for (const GeoDatCidr& cidr : group.cidrs) {
+      // Dropped rather than left to fight the override in the compiler: IPv4
+      // flattening breaks a same-prefix tie by action order and IPv6 lookup by
+      // array order, and the published ranges are prefix-for-prefix identical
+      // to the override's. Removing the loser is the only way this wins that
+      // does not depend on either of those internal orderings.
+      if (map.apple_push_via_fptn &&
+          IsInsideApplePush(cidr.is_ipv6, cidr.high, cidr.low, cidr.prefix)) {
+        ++result.report.apple_push_rules_overridden;
+        continue;
+      }
       GeoCidrInput input;
       input.is_ipv6 = cidr.is_ipv6;
       input.high = cidr.high;
@@ -259,6 +353,24 @@ GeoInputsResult BuildGeoInputs(const std::vector<GeoDatIpGroup>& ip_groups,
       input.action = action;
       result.inputs.cidrs.push_back(input);
     }
+  }
+
+  if (map.apple_push_via_fptn) {
+    for (const GeoPushRange& range : ApplePushRanges()) {
+      GeoCidrInput input;
+      input.is_ipv6 = range.is_ipv6;
+      input.high = range.high;
+      input.low = range.low;
+      input.prefix = range.prefix;
+      input.action = GeoAction::fptn;
+      result.inputs.cidrs.push_back(input);
+    }
+    // The name matters as much as the addresses. Address rules only apply once
+    // a connection is being made, whereas the domain rule decides the flow the
+    // moment the courier's name resolves -- and the published courier
+    // addresses change without the name ever doing so.
+    result.inputs.domains.push_back(GeoDomainInput{GeoDomainKind::suffix,
+        std::string(kApplePushDomain), GeoAction::fptn});
   }
 
   for (const GeoDatSiteGroup& group : site_groups) {
@@ -270,6 +382,18 @@ GeoInputsResult BuildGeoInputs(const std::vector<GeoDatIpGroup>& ip_groups,
     ++result.report.site_groups_used;
 
     for (const GeoDatDomain& domain : group.domains) {
+      // Suppressed rather than outvoted. The compiler resolves a name given
+      // two verdicts by rank, which would land on `fptn` here anyway, but it
+      // also counts that as a conflict -- and `domain_conflicts` is meant to
+      // report the published lists disagreeing with themselves, not us
+      // disagreeing with them on purpose.
+      if (map.apple_push_via_fptn &&
+          (domain.type == GeoDatDomainType::root_domain ||
+              domain.type == GeoDatDomainType::full) &&
+          IsUnderApplePushDomain(domain.value)) {
+        ++result.report.apple_push_rules_overridden;
+        continue;
+      }
       switch (domain.type) {
         case GeoDatDomainType::root_domain:
           result.inputs.domains.push_back(
