@@ -330,8 +330,21 @@ class FPTN(ConanFile):
              excludes=("build/*", "build-*/*"))
 
     def _use_mimalloc(self):
-        # mimalloc causes crashes on other platform
-        return self.settings.os != "Windows" and (self.settings.arch == "x86_64" or self.settings.os == "Macos")
+        # mimalloc causes crashes on other platform.
+        #
+        # Macos is excluded too. USING_MIMALLOC switches BatchIPPacketPtr
+        # between std::allocator and mi_stl_allocator, but package_info() never
+        # exports that define, so anything consuming this package compiles
+        # ip_packet.h with the std::allocator form while the library itself was
+        # built with the mimalloc form. A batch crossing that boundary is then
+        # allocated by mimalloc and freed by system free() —
+        # POINTER_BEING_FREED_WAS_NOT_ALLOCATED on the first inbound batch.
+        # The Apple Network Extension wrapper hit this as soon as it took the
+        # batch callback; iOS escaped only by not matching the predicate.
+        # Keeping Macos out also means the macOS profiling stand measures the
+        # same allocator iOS actually ships.
+        return self.settings.os not in ("Windows", "Macos") and (
+            self.settings.arch == "x86_64" or self.settings.os == "Macos")
 
     def _register_local_recipe(self, recipe, name, version, override=False, force=False, visible=True):
         script_dir = os.path.dirname(os.path.abspath(__file__))
