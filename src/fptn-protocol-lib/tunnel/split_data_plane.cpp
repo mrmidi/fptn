@@ -210,6 +210,10 @@ PacketInputResult SplitDataPlane::InputPackets(
   // concurrently with itself. Refusing the batch is a safe degradation: the
   // contract leaves every lease with the caller on any non-accepted result.
   if (partition_in_progress_.exchange(true, std::memory_order_acq_rel)) {
+    {
+      std::lock_guard lock(counters_mutex_);
+      ++counters_.partition_reentries;
+    }
     assert(false && "InputPackets re-entered concurrently; scratch reuse unsafe");
     return PacketInputResult::queue_full;
   }

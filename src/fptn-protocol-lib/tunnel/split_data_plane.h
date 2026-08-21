@@ -73,6 +73,14 @@ struct SplitCounters {
   std::uint64_t packets_to_transport = 0;
   std::uint64_t packets_dropped = 0;
   std::uint64_t rollbacks = 0;
+
+  // InputPackets entered while a previous call was still partitioning. Must
+  // stay zero: the scratch buffers are reused on the assumption that ingress
+  // never overlaps itself, and the assert that guards it is compiled out of
+  // the configuration actually measured (`assertions off`). Without this
+  // counter a re-entry is indistinguishable from transport backpressure,
+  // since both surface only as a refused batch.
+  std::uint64_t partition_reentries = 0;
 };
 
 // Runs both planes in one session: lwIP terminates the flows routed `direct`
