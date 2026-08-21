@@ -405,4 +405,90 @@ TEST_F(FlowClassifierTest, TableGrowthIsBounded) {
   EXPECT_GT(classifier->Counters().table_full_events, 0u);
 }
 
+TEST_F(FlowClassifierTest, MruServesConsecutiveIdenticalTuples) {
+  auto classifier = Make();
+  const auto a = MakeV4(V4(10, 8, 0, 2), V4(93, 184, 216, 34), 1000, 443);
+  const auto b = MakeV4(V4(10, 8, 0, 2), V4(93, 184, 216, 34), 1001, 443);
+
+  // First packet has no predecessor to match.
+  classifier->Classify(LeaseOf(a));
+  EXPECT_EQ(classifier->Counters().mru_hits, 0u);
+
+  // Two more of the same flow: both served by the MRU.
+  classifier->Classify(LeaseOf(a));
+  classifier->Classify(LeaseOf(a));
+  EXPECT_EQ(classifier->Counters().mru_hits, 2u);
+
+  // A different flow evicts it, so the next `a` misses -- this is the
+  // interleaving that decides whether a depth-1 cache is worth having.
+  classifier->Classify(LeaseOf(b));
+  classifier->Classify(LeaseOf(a));
+  EXPECT_EQ(classifier->Counters().mru_hits, 2u);
+
+  // The funnel identity must survive the fast path: five Classify() calls,
+  // two distinct flows, and MRU hits counted as table hits too.
+  const auto counters = classifier->Counters();
+  EXPECT_EQ(counters.classified_packets, 5u);
+  EXPECT_EQ(counters.decisions, 2u);
+  EXPECT_EQ(counters.classified_packets,
+      counters.table_hits + counters.decisions + counters.unclassifiable);
+  EXPECT_LE(counters.mru_hits, counters.table_hits);
+}
+
+TEST_F(FlowClassifierTest, MruDoesNotChangeVerdicts) {
+  attribution_.Set(V4(104, 21, 0, 1), "2ip.ru");
+  auto classifier = Make();
+  const auto packet = MakeV4(V4(10, 8, 0, 2), V4(104, 21, 0, 1), 1000, 443);
+
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_EQ(classifier->Classify(LeaseOf(packet)), RouteAction::direct);
+  }
+  EXPECT_EQ(classifier->Counters().mru_hits, 7u);
+  // One decision for the whole burst: the verdict stays pinned.
+  EXPECT_EQ(classifier->Counters().decisions, 1u);
+}
+
+// The hazard the MRU introduces if it skips the last_seen refresh: a flow
+// served entirely from the fast path would go stale and be swept while live.
+TEST_F(FlowClassifierTest, MruRefreshesLastSeenSoLiveFlowsSurvive) {
+  ClassifierConfiguration config;
+  config.flow_idle_timeout = std::chrono::milliseconds(60000);
+  auto classifier = Make(config);
+
+  const auto packet = MakeV4(V4(10, 8, 0, 2), V4(93, 184, 216, 34), 1000, 443);
+  classifier->Classify(LeaseOf(packet));
+  ASSERT_EQ(classifier->Counters().active_flows, 1u);
+
+  // Drive enough traffic through the MRU to cross a sweep boundary.
+  for (int i = 0; i < 5000; ++i) {
+    EXPECT_EQ(classifier->Classify(LeaseOf(packet)), RouteAction::fptn_l4);
+  }
+
+  // Still one flow, still one decision: the sweep ran but did not expire it,
+  // and no re-decision happened.
+  EXPECT_EQ(classifier->Counters().active_flows, 1u);
+  EXPECT_EQ(classifier->Counters().decisions, 1u);
+  EXPECT_EQ(classifier->Counters().expired_flows, 0u);
+}
+
+// The sweep erases entries, which invalidates the pointer the MRU holds.
+TEST_F(FlowClassifierTest, MruSurvivesASweepThatExpiresEverything) {
+  ClassifierConfiguration config;
+  config.flow_idle_timeout = std::chrono::milliseconds(0);
+  auto classifier = Make(config);
+
+  const auto a = MakeV4(V4(10, 8, 0, 2), V4(93, 184, 216, 34), 1000, 443);
+  classifier->Classify(LeaseOf(a));
+
+  // An explicit sweep expires the flow and must drop the MRU pointer with it.
+  ASSERT_EQ(classifier->ExpireIdle(std::chrono::steady_clock::now() +
+                std::chrono::seconds(1)),
+      1u);
+  EXPECT_EQ(classifier->Counters().active_flows, 0u);
+
+  // Re-classifying the same tuple must not read the erased entry.
+  EXPECT_EQ(classifier->Classify(LeaseOf(a)), RouteAction::fptn_l4);
+  EXPECT_EQ(classifier->Counters().active_flows, 1u);
+}
+
 }  // namespace
