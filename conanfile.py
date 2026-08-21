@@ -344,7 +344,7 @@ class FPTN(ConanFile):
         # Keeping Macos out also means the macOS profiling stand measures the
         # same allocator iOS actually ships.
         return self.settings.os not in ("Windows", "Macos") and (
-            self.settings.arch == "x86_64" or self.settings.os == "Macos")
+            self.settings.arch == "x86_64")
 
     def _register_local_recipe(self, recipe, name, version, override=False, force=False, visible=True):
         script_dir = os.path.dirname(os.path.abspath(__file__))
