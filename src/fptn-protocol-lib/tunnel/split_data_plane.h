@@ -135,6 +135,20 @@ class SplitDataPlane final : public IDataPlane {
   std::shared_ptr<const IRoutingPolicy> policy_;
   std::unique_ptr<DnsObserver> dns_observer_;
   std::unique_ptr<FlowClassifier> classifier_;
+
+  // Partition scratch, reused across batches instead of allocated per batch.
+  // Three vectors per batch cost ~200 cycles regardless of batch size, which
+  // at the measured loaded batch of ~14 packets was ~19 cyc/packet -- more
+  // than the classifier itself spends after the MRU landed.
+  //
+  // Safe to reuse only because ingress is serial: InputPackets runs on the
+  // packet-flow adapter's read callback, which reissues itself and never
+  // overlaps. Asserted below rather than assumed -- the NE guarantees
+  // non-concurrency, not thread affinity.
+  std::vector<PacketLease> scratch_to_stack_;
+  std::vector<PacketLease> scratch_to_transport_;
+  std::vector<PacketLease> scratch_to_drop_;
+  std::atomic<bool> partition_in_progress_{false};
   std::unique_ptr<TableBackedRouter> router_;
 
   TransportProvider transport_;

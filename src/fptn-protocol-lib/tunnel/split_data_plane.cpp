@@ -206,13 +206,35 @@ PacketInputResult SplitDataPlane::InputPackets(
     return PacketInputResult::accepted;
   }
 
+  // Reusing the scratch buffers is sound only while this never runs
+  // concurrently with itself. Refusing the batch is a safe degradation: the
+  // contract leaves every lease with the caller on any non-accepted result.
+  if (partition_in_progress_.exchange(true, std::memory_order_acq_rel)) {
+    assert(false && "InputPackets re-entered concurrently; scratch reuse unsafe");
+    return PacketInputResult::queue_full;
+  }
+  // Clears the scratch on every exit path, so no batch can ever observe leases
+  // left behind by the previous one -- those point at storage the caller has
+  // since released.
+  struct PartitionGuard {
+    SplitDataPlane* self;
+    ~PartitionGuard() {
+      self->scratch_to_stack_.clear();
+      self->scratch_to_transport_.clear();
+      self->scratch_to_drop_.clear();
+      self->partition_in_progress_.store(false, std::memory_order_release);
+    }
+  } partition_guard{this};
+
   // Partition by verdict. The batch ownership contract is all-or-nothing, so
   // nothing below may consume a lease until both planes have accepted their
   // half (H1).
-  std::vector<PacketLease> to_stack;
-  std::vector<PacketLease> to_transport;
-  std::vector<PacketLease> to_drop;
+  auto& to_stack = scratch_to_stack_;
+  auto& to_transport = scratch_to_transport_;
+  auto& to_drop = scratch_to_drop_;
   try {
+    // Grows to the high-water batch size once, then stops allocating: capacity
+    // survives the clear() in the guard.
     to_stack.reserve(packets.size());
     to_transport.reserve(packets.size());
   } catch (...) {
