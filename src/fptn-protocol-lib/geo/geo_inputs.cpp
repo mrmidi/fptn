@@ -310,7 +310,8 @@ GeoRegexReduction ReduceRegex(std::string_view pattern) {
 }
 
 GeoInputsResult BuildGeoInputs(const std::vector<GeoDatIpGroup>& ip_groups,
-    const std::vector<GeoDatSiteGroup>& site_groups, const GeoVerdictMap& map) {
+    const std::vector<GeoDatSiteGroup>& site_groups, const GeoVerdictMap& map,
+    const std::vector<GeoDomainInput>& domain_overrides) {
   GeoInputsResult result;
 
   const auto verdict = [](const std::unordered_map<std::string, GeoAction>& in,
@@ -436,7 +437,181 @@ GeoInputsResult BuildGeoInputs(const std::vector<GeoDatIpGroup>& ip_groups,
     }
   }
 
+  if (!domain_overrides.empty()) {
+    AppendDomainOverrides(result, domain_overrides);
+  }
+
   return result;
+}
+
+std::vector<GeoDomainInput> ParseDomainList(
+    std::string_view text, GeoAction default_action) {
+  std::vector<std::string> order;
+  std::unordered_map<std::string, GeoDomainInput> dedup_map;
+
+  auto trim = [](std::string_view s) -> std::string_view {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' ||
+                             s.front() == '\r' || s.front() == '\n')) {
+      s.remove_prefix(1);
+    }
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' ||
+                             s.back() == '\r' || s.back() == '\n')) {
+      s.remove_suffix(1);
+    }
+    return s;
+  };
+
+  std::size_t start = 0;
+  while (start < text.size()) {
+    std::size_t end = text.find('\n', start);
+    if (end == std::string_view::npos) {
+      end = text.size();
+    }
+    std::string_view line = text.substr(start, end - start);
+    start = end + 1;
+
+    // Strip comments (# or //)
+    const std::size_t hash_pos = line.find('#');
+    if (hash_pos != std::string_view::npos) {
+      line = line.substr(0, hash_pos);
+    }
+    const std::size_t slash_pos = line.find("//");
+    if (slash_pos != std::string_view::npos) {
+      line = line.substr(0, slash_pos);
+    }
+
+    line = trim(line);
+    if (line.empty()) {
+      continue;
+    }
+
+    // Lowercase the line so prefix checks (DOMAIN:, Full:, etc.) and domain names
+    // are completely case-insensitive.
+    std::string lowered = ToLowerAscii(std::string(line));
+    std::string_view lview = lowered;
+    lview = trim(lview);
+
+    // Action prefix (e.g. direct:, fptn:, drop:, reject:)
+    GeoAction action = default_action;
+    if (lview.starts_with("direct:")) {
+      action = GeoAction::direct;
+      lview = trim(lview.substr(7));
+    } else if (lview.starts_with("fptn:")) {
+      action = GeoAction::fptn;
+      lview = trim(lview.substr(5));
+    } else if (lview.starts_with("drop:")) {
+      action = GeoAction::drop;
+      lview = trim(lview.substr(5));
+    } else if (lview.starts_with("reject:")) {
+      action = GeoAction::reject;
+      lview = trim(lview.substr(7));
+    }
+
+    if (lview.empty()) {
+      continue;
+    }
+
+    // Domain kind prefix (domain:, full:, *., .)
+    GeoDomainKind kind = GeoDomainKind::suffix;
+    if (lview.starts_with("domain:")) {
+      kind = GeoDomainKind::suffix;
+      lview = trim(lview.substr(7));
+    } else if (lview.starts_with("full:")) {
+      kind = GeoDomainKind::exact;
+      lview = trim(lview.substr(5));
+    } else if (lview.starts_with("*.")) {
+      kind = GeoDomainKind::suffix;
+      lview = trim(lview.substr(2));
+    } else if (lview.starts_with(".")) {
+      kind = GeoDomainKind::suffix;
+      lview = trim(lview.substr(1));
+    }
+
+    lview = trim(lview);
+    if (lview.empty()) {
+      continue;
+    }
+
+    std::string canonical_domain(lview);
+    auto found = dedup_map.find(canonical_domain);
+    if (found == dedup_map.end()) {
+      order.push_back(canonical_domain);
+      dedup_map.emplace(canonical_domain,
+          GeoDomainInput{kind, canonical_domain, action});
+    } else {
+      found->second.action = action;
+      // Suffix subsumes exact
+      if (kind == GeoDomainKind::suffix) {
+        found->second.kind = GeoDomainKind::suffix;
+      }
+    }
+  }
+
+  std::vector<GeoDomainInput> result;
+  result.reserve(order.size());
+  for (const std::string& domain : order) {
+    result.push_back(std::move(dedup_map[domain]));
+  }
+  return result;
+}
+
+void AppendDomainOverrides(GeoInputsResult& result,
+    const std::vector<GeoDomainInput>& overrides) {
+  if (overrides.empty()) {
+    return;
+  }
+
+  auto is_same_or_subdomain = [](std::string_view domain, std::string_view parent) {
+    if (domain == parent) {
+      return true;
+    }
+    if (domain.size() > parent.size() + 1 &&
+        domain.ends_with(parent) &&
+        domain[domain.size() - parent.size() - 1] == '.') {
+      return true;
+    }
+    return false;
+  };
+
+  for (const GeoDomainInput& override_item : overrides) {
+    if (override_item.value.empty() || override_item.action == GeoAction::none) {
+      continue;
+    }
+    const std::string override_key = ToLowerAscii(override_item.value);
+
+    // If override is a suffix rule, clear conflicting base Geo DB subdomain rules
+    // so the suffix rule governs them as intended (Git list > Geo DB).
+    if (override_item.kind == GeoDomainKind::suffix) {
+      auto it = result.inputs.domains.begin();
+      while (it != result.inputs.domains.end()) {
+        const std::string existing_key = ToLowerAscii(it->value);
+        if (existing_key != override_key &&
+            is_same_or_subdomain(existing_key, override_key)) {
+          if (it->action != override_item.action) {
+            it = result.inputs.domains.erase(it);
+            ++result.report.domain_overrides_replaced;
+            continue;
+          }
+        }
+        ++it;
+      }
+    }
+
+    // Look for exact match
+    bool found = false;
+    for (auto& d : result.inputs.domains) {
+      if (ToLowerAscii(d.value) == override_key) {
+        d.action = override_item.action;
+        d.kind = override_item.kind;
+        found = true;
+        ++result.report.domain_overrides_replaced;
+      }
+    }
+    if (!found) {
+      result.inputs.domains.push_back(override_item);
+      ++result.report.domain_overrides_added;
+    }
+  }
 }
 
 }  // namespace fptn::geo

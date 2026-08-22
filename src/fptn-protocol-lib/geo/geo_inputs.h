@@ -157,6 +157,10 @@ struct GeoInputsReport {
   // become a no-op, which is worth noticing before someone assumes it is still
   // doing something.
   std::uint32_t apple_push_rules_overridden = 0;
+  // Domain overrides appended (e.g. from author Git blacklist / direct list)
+  std::uint32_t domain_overrides_added = 0;
+  std::uint32_t domain_overrides_replaced = 0;
+  std::uint32_t domain_overrides_deduped = 0;
 };
 
 struct GeoInputsResult {
@@ -164,7 +168,30 @@ struct GeoInputsResult {
   GeoInputsReport report;
 };
 
+// Parses a line-separated list of domains (e.g. from git russia.txt or user config).
+// Formats supported per line:
+//   - domain:example.com -> GeoDomainKind::suffix
+//   - full:example.com   -> GeoDomainKind::exact
+//   - *.example.com      -> GeoDomainKind::suffix
+//   - .example.com       -> GeoDomainKind::suffix
+//   - example.com        -> GeoDomainKind::suffix
+//   - Comments (# or //) and empty lines are ignored.
+//   - Optional action prefix: "direct:domain:foo", "fptn:bar", "drop:full:baz", "reject:qux"
+// Deduplicates and canonicalizes names within the list itself. Suffix subsumes exact.
+std::vector<GeoDomainInput> ParseDomainList(std::string_view text,
+    GeoAction default_action = GeoAction::direct);
+
+// Appends domain overrides into GeoInputsResult.
+// Git List > Geo DB precedence:
+// Any domain in `overrides` takes unconditional precedence over existing rules
+// for that domain in `result.inputs.domains`. If an entry for the domain already
+// exists, its action and kind are replaced by the override. If it did not exist,
+// it is added.
+void AppendDomainOverrides(GeoInputsResult& result,
+    const std::vector<GeoDomainInput>& overrides);
+
 GeoInputsResult BuildGeoInputs(const std::vector<GeoDatIpGroup>& ip_groups,
-    const std::vector<GeoDatSiteGroup>& site_groups, const GeoVerdictMap& map);
+    const std::vector<GeoDatSiteGroup>& site_groups, const GeoVerdictMap& map,
+    const std::vector<GeoDomainInput>& domain_overrides = {});
 
 }  // namespace fptn::geo

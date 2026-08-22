@@ -61,6 +61,11 @@ add_executable(GeoRoutingPolicyTest geo/GeoRoutingPolicyTest.cpp)
 target_link_libraries(GeoRoutingPolicyTest PRIVATE ${LIBS})
 add_test(NAME GeoRoutingPolicyTest COMMAND GeoRoutingPolicyTest)
 
+# Domain list parsing, deduplication, and Git override precedence.
+add_executable(GeoInputsTest geo/GeoInputsTest.cpp)
+target_link_libraries(GeoInputsTest PRIVATE ${LIBS})
+add_test(NAME GeoInputsTest COMMAND GeoInputsTest)
+
 # R2: 5-tuple peek, flow table and pinned classifier rules.
 add_executable(FlowClassifierTest tunnel/FlowClassifierTest.cpp)
 target_link_libraries(FlowClassifierTest PRIVATE ${LIBS})
